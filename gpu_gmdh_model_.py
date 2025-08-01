@@ -1,7 +1,31 @@
+import rmm
+from rmm import mr
+from rmm.allocators.cupy import rmm_cupy_allocator
 import cupy as cp
-from gpu_polynomial_module import PolynomialGPU
-import matplotlib.pyplot as plt
 
+# Setup: Optional pool with no maximum size
+initial_pool_size = 512 * 1024 * 1024  # 512 MB
+upstream = mr.CudaMemoryResource()
+pool = mr.PoolMemoryResource(upstream, initial_pool_size=initial_pool_size, maximum_pool_size=16000 * 1024 * 1024)
+
+# Wrap with tracking adaptor
+tracked = mr.TrackingResourceAdaptor(pool)
+rmm.mr.set_current_device_resource(tracked)
+cp.cuda.set_allocator(rmm_cupy_allocator)
+
+# Check memory usage
+res = rmm.mr.get_current_device_resource()
+free_mem, total_mem = cp.cuda.runtime.memGetInfo()
+print(f"GPU free memory: {free_mem / 1024**3:.2f} GB / {total_mem / 1024**3:.2f} GB")
+
+
+# These must be called on the `TrackingResourceAdaptor` only:
+print(f"RMM currently allocated: {res.get_allocated_bytes() / 1e6:.2f} MB")
+
+
+from gpu_polynomial_module import PolynomialGPU
+from cuda_least_squares import least_squares_gpu
+import matplotlib.pyplot as plt
 
 def generate_incompressibility_constraint_refactored(u_s, u_k, grad_s, grad_k):
     div_rest = cp.sum(grad_s[:-1], axis=0)
@@ -98,6 +122,8 @@ class PhysicsAwareGMDH:
             ], axis=1)
 
             phi_parts.append(phi_chunk)
+        
+        
 
         try:
             phi = cp.concatenate(phi_parts, axis=0)
@@ -122,6 +148,11 @@ class PhysicsAwareGMDH:
 
             for idx_a in range(total_models):
                 for idx_b in range(idx_a + 1, total_models):
+                    print("Layer= ", self.current_layer)
+                    print(f"Processing component {comp_idx}, models {idx_a} and {idx_b}")
+                    allocated = rmm.mr.get_current_device_resource().get_allocated_bytes()
+                    print(f"RMM allocated: {allocated / 1e6:.2f} MB")
+
                     for pair in [(idx_a, idx_b), (idx_b, idx_a)]:
                         s_idx, k_idx = pair
 
@@ -148,9 +179,9 @@ class PhysicsAwareGMDH:
                                 pressure_poly, comp_idx, self.viscosity
                             )
                             phi, u_hat = self._append_constraint(phi, u_hat, mom_row, mom_rhs)
-
+                        
                         try:
-                            coef = solve_least_squares(phi, u_hat)
+                            coef = cp.asarray(least_squares_gpu(phi, u_hat))
                         except cp.linalg.LinAlgError:
                             continue
 
@@ -183,6 +214,8 @@ class PhysicsAwareGMDH:
 
                         del phi, coef, y_pred_i
                         cp._default_memory_pool.free_all_blocks()
+                        allocated = rmm.mr.get_current_device_resource().get_allocated_bytes()
+                        print(f"RMM afer romoving allocated: {allocated / 1e6:.2f} MB")
 
         return candidates, error_vectors, y_preds
 
@@ -193,9 +226,7 @@ class PhysicsAwareGMDH:
 
         if self.current_layer == 0:
             self.models = [self._initialize_first_layer(n_components=y.shape[0])]
-        for i in range(len(self.models[-1])):
-            for j in range(len(self.models[-1][i])): 
-                print(self.models[-1][i][j].exponents)
+        
         while self.current_layer < self.max_layer:
             self.u_tensor = cp.stack([
                 cp.stack([cp.asarray(m.evaluate(self.X)) for m in comp_models])
@@ -219,18 +250,18 @@ class PhysicsAwareGMDH:
                  for m in comp_models]
                 for comp_models in self.models[-1]
             ]
-
+            
             candidates, errors, preds = self._least_squares_step(pressure_poly, constraints or {})
             if not candidates:
                 break
-
+          
             self.error_tensor = cp.stack(errors)
-            print(cp.nansum(self.error_tensor, axis=1))
             best = cp.argsort(cp.nansum(self.error_tensor, axis=1))[:self.top_models]
             new_models = [[] for _ in range(self.y.shape[0])]
             for idx in best:
                 comp_idx, s, k, coef = candidates[int(idx)]
-                print(coef)
+                
+                
                 model = self.models[-1][comp_idx][s].combine_with_gpu(
                     self.models[-1][comp_idx][k], *cp.asnumpy(coef))
                 for j in range(self.y.shape[0]):
@@ -239,10 +270,6 @@ class PhysicsAwareGMDH:
             self.err_line.append(cp.min(cp.nansum(self.error_tensor, axis=1)))
             self.y_pred = [preds[int(best[0])]]
             self.current_layer += 1
-        print(self.models[-1][0][0].exponents)
-        print(self.models[-1][1][0].exponents)
-        print(self.models[-1][0][1].exponents)
-        print(self.models[-1][1][1].exponents)
         return self
 
     def plot_profile(self, var_index=0, fixed_values=None, n_points=100, u_true_funcs=None):
@@ -282,6 +309,7 @@ class PhysicsAwareGMDH:
 
 
 if __name__ == "__main__":
+   
     def u1(x, y, t): return cp.cos(x) * cp.sin(y) * cp.exp(-2 * 0.01 * t)
     def u2(x, y, t): return -cp.sin(x) * cp.cos(y) * cp.exp(-2 * 0.01 * t)
 
@@ -292,6 +320,7 @@ if __name__ == "__main__":
     u1_vals = cp.asarray(u1(x, y, t)).reshape(-1)
     u2_vals = cp.asarray(u2(x, y, t)).reshape(-1)
     assert u1_vals.shape == u2_vals.shape, f"Shape mismatch: {u1_vals.shape} vs {u2_vals.shape}"
+    print(cp.get_default_memory_pool())
 
     model = PhysicsAwareGMDH(n_features=3, max_layer=4, top_models=50)
     model.fit(X, y=cp.stack([u1_vals, u2_vals]), pressure=None, constraints={"incompressibility": False, "momentum": False})

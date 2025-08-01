@@ -1,7 +1,7 @@
 # # Multivariate Polynomial Multiplication with GPU (CuPy, Dask, CuDF, Numba)
 
+
 import numpy as np
-import cupy as cp
 import cudf
 import dask.array as da 
 
