@@ -2,30 +2,31 @@ import rmm
 from rmm import mr
 from rmm.allocators.cupy import rmm_cupy_allocator
 import cupy as cp
+import matplotlib.pyplot as plt
+import dask
+from dask import delayed
+# --- RMM Memory Setup ---
+initial_pool_size = 512 * 1024 * 1024       # 512 MB
+max_pool_size = 10 * 1024 * 1024 * 1024     # 10 GB max pool
 
-# Setup: Optional pool with no maximum size
-initial_pool_size = 512 * 1024 * 1024  # 512 MB
 upstream = mr.CudaMemoryResource()
-pool = mr.PoolMemoryResource(upstream, initial_pool_size=initial_pool_size, maximum_pool_size=16000 * 1024 * 1024)
-
-# Wrap with tracking adaptor
+pool = mr.PoolMemoryResource(
+    upstream,
+    initial_pool_size=initial_pool_size,
+    maximum_pool_size=max_pool_size
+)
 tracked = mr.TrackingResourceAdaptor(pool)
 rmm.mr.set_current_device_resource(tracked)
 cp.cuda.set_allocator(rmm_cupy_allocator)
 
-# Check memory usage
-res = rmm.mr.get_current_device_resource()
-free_mem, total_mem = cp.cuda.runtime.memGetInfo()
-print(f"GPU free memory: {free_mem / 1024**3:.2f} GB / {total_mem / 1024**3:.2f} GB")
-
-
-# These must be called on the `TrackingResourceAdaptor` only:
-print(f"RMM currently allocated: {res.get_allocated_bytes() / 1e6:.2f} MB")
-
+print(f"GPU free memory: {cp.cuda.runtime.memGetInfo()[0] / 1024**3:.2f} GB / "
+      f"{cp.cuda.runtime.memGetInfo()[1] / 1024**3:.2f} GB")
+print(f"RMM currently allocated: {tracked.get_allocated_bytes() / 1e6:.2f} MB")
 
 from gpu_polynomial_module import PolynomialGPU
 from cuda_least_squares import least_squares_gpu
-import matplotlib.pyplot as plt
+
+# --- Helper functions ---
 
 def generate_incompressibility_constraint_refactored(u_s, u_k, grad_s, grad_k):
     div_rest = cp.sum(grad_s[:-1], axis=0)
@@ -69,16 +70,69 @@ def generate_momentum_constraint_refactored(
 
     phi_row = [phi0, phi1, phi2, phi3]
 
-    pressure_grad = cp.asarray(pressure_poly.differentiate(i).evaluate(X)) if pressure_poly else cp.zeros_like(phi0)
+    pressure_grad = (
+        cp.asarray(pressure_poly.differentiate(i).evaluate(X))
+        if pressure_poly else cp.zeros_like(phi0)
+    )
     return phi_row, pressure_grad
 
+
 def solve_least_squares(phi, y):
-    # Solving the normal equation: theta = (X-transpose * X)^(-1) * X-transpose * y
     xtx = phi.T @ phi
     xty = phi.T @ y
     return cp.linalg.solve(xtx, xty)
 
+@delayed
+def evaluate_model_pair(comp_idx, s_idx, k_idx, model_state):
+    # Unpack everything needed from the passed state
+    u_s = model_state['u_tensor'][comp_idx, s_idx]
+    u_k = model_state['u_tensor'][comp_idx, k_idx]
+    u_hat = model_state['y'][comp_idx]
+    grad_s = model_state['u_grads_tensor'][comp_idx, s_idx]
+    grad_k = model_state['u_grads_tensor'][comp_idx, k_idx]
+    
+    phi = model_state['build_phi'](u_s, u_k)
+    
+    if model_state['constraints'].get('incompressibility'):
+        inc_row, inc_rhs = model_state['generate_incompressibility'](u_s, u_k, grad_s, grad_k)
+        phi, u_hat = model_state['append_constraint'](phi, u_hat, inc_row, inc_rhs)
+    
+    if model_state['constraints'].get('momentum'):
+        mom_row, mom_rhs = model_state['generate_momentum'](
+            model_state['X'], u_s, u_k, grad_s, grad_k,
+            model_state['u_tensor'][comp_idx], model_state['u_grads_tensor'][comp_idx],
+            model_state['u_dt'][comp_idx][s_idx], model_state['u_dt'][comp_idx][k_idx],
+            model_state['u_laplace'][comp_idx][s_idx], model_state['u_laplace'][comp_idx][k_idx],
+            model_state['pressure_poly'], comp_idx, model_state['viscosity']
+        )
+        phi, u_hat = model_state['append_constraint'](phi, u_hat, mom_row, mom_rhs)
+    
+    try:
+        coef = cp.asarray(least_squares_gpu(phi, u_hat))
+    except cp.linalg.LinAlgError:
+        return None
 
+    y_pred_i = phi @ coef
+    error_vec = []
+    sample_size = model_state['X'].shape[0]
+
+    main_diff = y_pred_i[:sample_size] - u_hat[:sample_size]
+    mse_main = cp.sum(cp.nan_to_num(main_diff) ** 2) / main_diff.size
+    error_vec.append(mse_main)
+
+    for j in range(model_state['y'].shape[0]):
+        if j == comp_idx:
+            continue
+        residual_diff = model_state['u_tensor'][j, s_idx] - model_state['y'][j]
+        mse_other = cp.sum(cp.nan_to_num(residual_diff) ** 2) / residual_diff.size
+        error_vec.append(mse_other)
+
+    constraint_residual = y_pred_i[sample_size:] - u_hat[sample_size:]
+    mse_constraint = 0.5 * cp.sum(cp.nan_to_num(constraint_residual) ** 2) / constraint_residual.size
+    error_vec.append(mse_constraint)
+
+    return (comp_idx, s_idx, k_idx, coef, cp.array(error_vec), y_pred_i)
+# --- Main class ---
 
 class PhysicsAwareGMDH:
     def __init__(self, n_features=3, max_layer=5, top_models=4, viscosity=0.01):
@@ -91,6 +145,7 @@ class PhysicsAwareGMDH:
         self.y_pred = None
         self.current_layer = 0
 
+        # Placeholders for training data and derivatives
         self.X = None
         self.y = None
         self.u_tensor = None
@@ -122,8 +177,6 @@ class PhysicsAwareGMDH:
             ], axis=1)
 
             phi_parts.append(phi_chunk)
-        
-        
 
         try:
             phi = cp.concatenate(phi_parts, axis=0)
@@ -132,15 +185,32 @@ class PhysicsAwareGMDH:
             phi = cp.concatenate(phi_parts, axis=0)
 
         return phi
-    
+
     def _append_constraint(self, phi, u_hat, phi_block, rhs):
         phi_block = cp.stack(phi_block, axis=1)
         return cp.vstack([phi, phi_block]), cp.append(u_hat, rhs)
 
     def _least_squares_step(self, pressure_poly, constraints):
-        candidates, error_vectors, y_preds = [], [], []
+        delayed_tasks = []
         previous_models = self.models[-1]
         total_components = len(previous_models)
+
+        # Prepare common state for all tasks
+        model_state = {
+            'X': self.X,
+            'y': self.y,
+            'u_tensor': self.u_tensor,
+            'u_grads_tensor': self.u_grads_tensor,
+            'u_dt': self.u_dt,
+            'u_laplace': self.u_laplace,
+            'pressure_poly': pressure_poly,
+            'viscosity': self.viscosity,
+            'constraints': constraints,
+            'build_phi': self._build_phi_matrix,
+            'append_constraint': self._append_constraint,
+            'generate_incompressibility': generate_incompressibility_constraint_refactored,
+            'generate_momentum': generate_momentum_constraint_refactored,
+        }
 
         for comp_idx in range(total_components):
             models_in_component = previous_models[comp_idx]
@@ -148,76 +218,24 @@ class PhysicsAwareGMDH:
 
             for idx_a in range(total_models):
                 for idx_b in range(idx_a + 1, total_models):
-                    print("Layer= ", self.current_layer)
-                    print(f"Processing component {comp_idx}, models {idx_a} and {idx_b}")
-                    allocated = rmm.mr.get_current_device_resource().get_allocated_bytes()
-                    print(f"RMM allocated: {allocated / 1e6:.2f} MB")
+                    for s_idx, k_idx in [(idx_a, idx_b), (idx_b, idx_a)]:
+                        task = evaluate_model_pair(comp_idx, s_idx, k_idx, model_state)
+                        delayed_tasks.append(task)
 
-                    for pair in [(idx_a, idx_b), (idx_b, idx_a)]:
-                        s_idx, k_idx = pair
-
-                        u_s = self.u_tensor[comp_idx, s_idx]
-                        u_k = self.u_tensor[comp_idx, k_idx]
-                        phi = self._build_phi_matrix(u_s, u_k)
-                        u_hat = self.y[comp_idx]
-
-                        grad_s = self.u_grads_tensor[comp_idx, s_idx]
-                        grad_k = self.u_grads_tensor[comp_idx, k_idx]
-
-                        if constraints.get('incompressibility', False):
-                            inc_row, inc_rhs = generate_incompressibility_constraint_refactored(
-                                u_s, u_k, grad_s, grad_k
-                            )
-                            phi, u_hat = self._append_constraint(phi, u_hat, inc_row, inc_rhs)
-
-                        if constraints.get('momentum', False):
-                            mom_row, mom_rhs = generate_momentum_constraint_refactored(
-                                self.X, u_s, u_k, grad_s, grad_k,
-                                self.u_tensor[comp_idx], self.u_grads_tensor[comp_idx],
-                                self.u_dt[comp_idx][s_idx], self.u_dt[comp_idx][k_idx],
-                                self.u_laplace[comp_idx][s_idx], self.u_laplace[comp_idx][k_idx],
-                                pressure_poly, comp_idx, self.viscosity
-                            )
-                            phi, u_hat = self._append_constraint(phi, u_hat, mom_row, mom_rhs)
-                        
-                        try:
-                            coef = cp.asarray(least_squares_gpu(phi, u_hat))
-                        except cp.linalg.LinAlgError:
-                            continue
-
-                        y_pred_i = phi @ coef
-                        error_vec = []
-                        sample_size = self.X.shape[0]
-
-                        # Mean squared error of main component
-                        main_diff = y_pred_i[:sample_size] - self.y[comp_idx]
-                        mse_main = cp.sum(cp.nan_to_num(main_diff) ** 2) / main_diff.size
-                        error_vec.append(mse_main)
-
-                        # Mean squared error of remaining components
-                        for j in range(self.y.shape[0]):
-                            if j == comp_idx:
-                                continue
-                            residual_diff = self.u_tensor[j, s_idx] - self.y[j]
-                            mse_other = cp.sum(cp.nan_to_num(residual_diff) ** 2) / residual_diff.size
-                            error_vec.append(mse_other)
-
-                        # Constraint error
-                        constraint_residual = y_pred_i[sample_size:] - u_hat[sample_size:]
-                        mse_constraint = 0.5 * cp.sum(cp.nan_to_num(constraint_residual) ** 2) / constraint_residual.size
-                        error_vec.append(mse_constraint)
-
-                        error_vector = cp.array(error_vec)
-                        error_vectors.append(error_vector)
-                        candidates.append((comp_idx, s_idx, k_idx, coef))
-                        y_preds.append(y_pred_i)
-
-                        del phi, coef, y_pred_i
-                        cp._default_memory_pool.free_all_blocks()
-                        allocated = rmm.mr.get_current_device_resource().get_allocated_bytes()
-                        print(f"RMM afer romoving allocated: {allocated / 1e6:.2f} MB")
+        results = dask.compute(*delayed_tasks)
+    
+        # Filter out failed cases
+        candidates, error_vectors, y_preds = [], [], []
+        for res in results:
+            if res is None:
+                continue
+            comp_idx, s_idx, k_idx, coef, error_vec, y_pred_i = res
+            candidates.append((comp_idx, s_idx, k_idx, coef))
+            error_vectors.append(error_vec)
+            y_preds.append(y_pred_i)
 
         return candidates, error_vectors, y_preds
+
 
     def fit(self, X, y, pressure=None, constraints=None):
         self.X = cp.asarray(X)
@@ -226,7 +244,7 @@ class PhysicsAwareGMDH:
 
         if self.current_layer == 0:
             self.models = [self._initialize_first_layer(n_components=y.shape[0])]
-        
+
         while self.current_layer < self.max_layer:
             self.u_tensor = cp.stack([
                 cp.stack([cp.asarray(m.evaluate(self.X)) for m in comp_models])
@@ -250,26 +268,33 @@ class PhysicsAwareGMDH:
                  for m in comp_models]
                 for comp_models in self.models[-1]
             ]
-            
+            print ("u_tensor shape: ", self.u_tensor.shape)
+            print ("u_grads_tensor shape: ", self.u_grads_tensor.shape)
+            print ("u_dt shape: ", len(self.u_dt), len(self.u_dt[0]))
+            print ("u_laplace shape: ", len(self.u_laplace), len(self.u_laplace[0]), len(self.u_laplace[0][0]))
             candidates, errors, preds = self._least_squares_step(pressure_poly, constraints or {})
             if not candidates:
                 break
-          
+
             self.error_tensor = cp.stack(errors)
             best = cp.argsort(cp.nansum(self.error_tensor, axis=1))[:self.top_models]
+
             new_models = [[] for _ in range(self.y.shape[0])]
             for idx in best:
                 comp_idx, s, k, coef = candidates[int(idx)]
-                
-                
+
                 model = self.models[-1][comp_idx][s].combine_with_gpu(
-                    self.models[-1][comp_idx][k], *cp.asnumpy(coef))
+                    self.models[-1][comp_idx][k], *cp.asnumpy(coef)
+                )
                 for j in range(self.y.shape[0]):
                     new_models[j].append(self.models[-1][j][s] if j != comp_idx else model)
+
             self.models.append(new_models)
+            self.models[-2] = None
             self.err_line.append(cp.min(cp.nansum(self.error_tensor, axis=1)))
             self.y_pred = [preds[int(best[0])]]
             self.current_layer += 1
+
         return self
 
     def plot_profile(self, var_index=0, fixed_values=None, n_points=100, u_true_funcs=None):
@@ -287,7 +312,6 @@ class PhysicsAwareGMDH:
             best_model = comp_models[0]
             u_pred = cp.asarray(best_model.evaluate(X_test))
             preds.append(u_pred)
-
 
         for i, (pred, true_label) in enumerate(zip(preds, ["$u_1$", "$u_2$"])):
             plt.figure(figsize=(8, 4))
@@ -307,20 +331,20 @@ class PhysicsAwareGMDH:
             plt.show()
 
 
+# --- Usage example ---
 
 if __name__ == "__main__":
-   
+    # Define velocity functions
     def u1(x, y, t): return cp.cos(x) * cp.sin(y) * cp.exp(-2 * 0.01 * t)
     def u2(x, y, t): return -cp.sin(x) * cp.cos(y) * cp.exp(-2 * 0.01 * t)
 
-    n = 1000000
+    n = 1_000_000
     x, y, t = cp.random.rand(n), cp.random.rand(n), cp.random.rand(n)
     X = cp.column_stack([x, y, t])
 
     u1_vals = cp.asarray(u1(x, y, t)).reshape(-1)
     u2_vals = cp.asarray(u2(x, y, t)).reshape(-1)
     assert u1_vals.shape == u2_vals.shape, f"Shape mismatch: {u1_vals.shape} vs {u2_vals.shape}"
-    print(cp.get_default_memory_pool())
 
     model = PhysicsAwareGMDH(n_features=3, max_layer=4, top_models=50)
     model.fit(X, y=cp.stack([u1_vals, u2_vals]), pressure=None, constraints={"incompressibility": False, "momentum": False})
@@ -332,8 +356,7 @@ if __name__ == "__main__":
     plt.grid(True)
     plt.show()
 
-    # Additional test plots
+    # Test plots
     model.plot_profile(var_index=0, u_true_funcs=[u1, u2])
     model.plot_profile(var_index=1, u_true_funcs=[u1, u2])
     model.plot_profile(var_index=2, u_true_funcs=[u1, u2])
-

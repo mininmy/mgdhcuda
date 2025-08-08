@@ -254,7 +254,10 @@ class PhysicsAwareGMDH:
                  for m in comp_models]
                 for comp_models in self.models[-1]
             ]
-
+            print ("u_tensor shape: ", self.u_tensor.shape)
+            print ("u_grads_tensor shape: ", self.u_grads_tensor.shape)
+            print ("u_dt shape: ", len(self.u_dt), len(self.u_dt[0]))
+            print ("u_laplace shape: ", len(self.u_laplace), len(self.u_laplace[0]), len(self.u_laplace[0][0]))
             candidates, errors, preds = self._least_squares_step(pressure_poly, constraints or {})
             if not candidates:
                 break
@@ -273,6 +276,7 @@ class PhysicsAwareGMDH:
                     new_models[j].append(self.models[-1][j][s] if j != comp_idx else model)
 
             self.models.append(new_models)
+            self.models[-2] = None
             self.err_line.append(cp.min(cp.nansum(self.error_tensor, axis=1)))
             self.y_pred = [preds[int(best[0])]]
             self.current_layer += 1
