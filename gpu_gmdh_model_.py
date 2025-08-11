@@ -1,28 +1,19 @@
-import rmm
-from rmm import mr
-from rmm.allocators.cupy import rmm_cupy_allocator
-import cupy as cp
-import matplotlib.pyplot as plt
-import dask
+# gpu_gmdh_model_.py
+
+from dask_cuda import LocalCUDACluster
+from dask.distributed import Client
 from dask import delayed
-# --- RMM Memory Setup ---
-initial_pool_size = 512 * 1024 * 1024       # 512 MB
-max_pool_size = 10 * 1024 * 1024 * 1024     # 10 GB max pool
+import rmm
+import cupy as cp
+import dask
 
-upstream = mr.CudaMemoryResource()
-pool = mr.PoolMemoryResource(
-    upstream,
-    initial_pool_size=initial_pool_size,
-    maximum_pool_size=max_pool_size
-)
-tracked = mr.TrackingResourceAdaptor(pool)
-rmm.mr.set_current_device_resource(tracked)
-cp.cuda.set_allocator(rmm_cupy_allocator)
+# Import your GMDH model and data setup code
+from gpu_polynomial_module import PolynomialGPU
+from cuda_least_squares import least_squares_gpu
 
-print(f"GPU free memory: {cp.cuda.runtime.memGetInfo()[0] / 1024**3:.2f} GB / "
-      f"{cp.cuda.runtime.memGetInfo()[1] / 1024**3:.2f} GB")
-print(f"RMM currently allocated: {tracked.get_allocated_bytes() / 1e6:.2f} MB")
 
+import matplotlib.pyplot as plt
+from config_constants import MAX_EXP
 from gpu_polynomial_module import PolynomialGPU
 from cuda_least_squares import least_squares_gpu
 
@@ -332,9 +323,31 @@ class PhysicsAwareGMDH:
 
 
 # --- Usage example ---
+def initialize_dask():
+    """Set up RMM and Dask-CUDA cluster."""
+    rmm.reinitialize(
+        pool_allocator=True,
+        initial_pool_size="512MB",
+        maximum_pool_size="10GB",
+        devices=0,  # change if using multiple GPUs
+    )
 
-if __name__ == "__main__":
-    # Define velocity functions
+    cluster = LocalCUDACluster(
+        CUDA_VISIBLE_DEVICES="0",               # or something like "0,1"
+        rmm_pool_size="10GB",
+        memory_limit="10GB",
+        device_memory_limit="10GB",
+        dashboard_address=":8789"               # to avoid port 8787 conflict
+    )
+
+    client = Client(cluster)
+    print(f"Dask-CUDA cluster started. Dashboard: {client.dashboard_link}")
+    return client
+
+
+def run_training():
+    """Main training logic."""
+    # Load or create input data
     def u1(x, y, t): return cp.cos(x) * cp.sin(y) * cp.exp(-2 * 0.01 * t)
     def u2(x, y, t): return -cp.sin(x) * cp.cos(y) * cp.exp(-2 * 0.01 * t)
 
@@ -344,11 +357,20 @@ if __name__ == "__main__":
 
     u1_vals = cp.asarray(u1(x, y, t)).reshape(-1)
     u2_vals = cp.asarray(u2(x, y, t)).reshape(-1)
-    assert u1_vals.shape == u2_vals.shape, f"Shape mismatch: {u1_vals.shape} vs {u2_vals.shape}"
 
+    # Initialize model
     model = PhysicsAwareGMDH(n_features=3, max_layer=4, top_models=50)
-    model.fit(X, y=cp.stack([u1_vals, u2_vals]), pressure=None, constraints={"incompressibility": False, "momentum": False})
 
+    # Run training
+    model.fit(
+        X,
+        y=cp.stack([u1_vals, u2_vals]),
+        pressure=None,
+        constraints={
+            "incompressibility": False,
+            "momentum": False
+        }
+    )
     plt.plot(cp.asnumpy(cp.array(model.err_line)), marker='o')
     plt.title("Training Error per Layer")
     plt.xlabel("Layer")
@@ -356,7 +378,9 @@ if __name__ == "__main__":
     plt.grid(True)
     plt.show()
 
-    # Test plots
-    model.plot_profile(var_index=0, u_true_funcs=[u1, u2])
-    model.plot_profile(var_index=1, u_true_funcs=[u1, u2])
-    model.plot_profile(var_index=2, u_true_funcs=[u1, u2])
+
+
+if __name__ == "__main__":
+    initialize_dask()
+    run_training()
+

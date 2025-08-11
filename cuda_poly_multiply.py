@@ -4,12 +4,13 @@
 import numpy as np
 import cudf
 import dask.array as da 
-
+import cupy as cp
 from numba import cuda, uint8, float64
 from dask import delayed
 from dask_cuda import LocalCUDACluster
 from dask.distributed import Client
 from config_constants import MAX_EXP
+from cuda_least_squares import least_squares_gpu
 # --- Constants ---
 NVARS = 3
 BLOCK_SIZE_X = 8
@@ -101,6 +102,67 @@ def launch_cuda_kernel(exp_A, exp_B, coeff_A, coeff_B):
     
     
 
+def evaluate_model_pair(comp_idx, s_idx, k_idx, model_state):
+    # Extract model state data
+    u_s_cpu = model_state['u_tensor_cpu'][comp_idx, s_idx]
+    u_k_cpu = model_state['u_tensor_cpu'][comp_idx, k_idx]
+    u_hat_cpu = model_state['y_cpu'][comp_idx]
+
+    grad_s_cpu = model_state['u_grads_tensor_cpu'][comp_idx, s_idx]
+    grad_k_cpu = model_state['u_grads_tensor_cpu'][comp_idx, k_idx]
+
+    # Transfer needed chunks to GPU
+    u_s = cp.asarray(u_s_cpu)
+    u_k = cp.asarray(u_k_cpu)
+    u_hat = cp.asarray(u_hat_cpu)
+    grad_s = cp.asarray(grad_s_cpu)
+    grad_k = cp.asarray(grad_k_cpu)
+
+    # Build phi matrix on GPU
+    phi = model_state['build_phi'](u_s, u_k)
+
+    # Constraints
+    if model_state['constraints'].get('incompressibility'):
+        inc_row, inc_rhs = model_state['generate_incompressibility'](u_s, u_k, grad_s, grad_k)
+        phi, u_hat = model_state['append_constraint'](phi, u_hat, inc_row, inc_rhs)
+
+    if model_state['constraints'].get('momentum'):
+        mom_row, mom_rhs = model_state['generate_momentum'](
+            model_state['X_gpu'], u_s, u_k, grad_s, grad_k,
+            model_state['u_tensor_gpu'][comp_idx], model_state['u_grads_tensor_gpu'][comp_idx],
+            model_state['u_dt_gpu'][comp_idx][s_idx], model_state['u_dt_gpu'][comp_idx][k_idx],
+            model_state['u_laplace_gpu'][comp_idx][s_idx], model_state['u_laplace_gpu'][comp_idx][k_idx],
+            model_state['pressure_poly'], comp_idx, model_state['viscosity']
+        )
+        phi, u_hat = model_state['append_constraint'](phi, u_hat, mom_row, mom_rhs)
+
+    try:
+        coef = cp.asarray(least_squares_gpu(phi, u_hat))
+    except cp.linalg.LinAlgError:
+        return None
+
+    y_pred_i = phi @ coef
+
+    error_vec = []
+    sample_size = model_state['X_cpu'].shape[0]
+
+    main_diff = y_pred_i[:sample_size] - u_hat[:sample_size]
+    mse_main = cp.sum(cp.nan_to_num(main_diff) ** 2) / main_diff.size
+    error_vec.append(mse_main)
+
+    for j in range(model_state['y_cpu'].shape[0]):
+        if j == comp_idx:
+            continue
+        residual_diff = model_state['u_tensor_gpu'][j, s_idx] - model_state['y_gpu'][j]
+        mse_other = cp.sum(cp.nan_to_num(residual_diff) ** 2) / residual_diff.size
+        error_vec.append(mse_other)
+
+    constraint_residual = y_pred_i[sample_size:] - u_hat[sample_size:]
+    mse_constraint = 0.5 * cp.sum(cp.nan_to_num(constraint_residual) ** 2) / constraint_residual.size
+    error_vec.append(mse_constraint)
+
+    # Move results back to CPU to reduce GPU memory pressure
+    return (comp_idx, s_idx, k_idx, cp.asnumpy(coef), cp.asnumpy(cp.array(error_vec)), cp.asnumpy(y_pred_i))
 
 def main():
     # --- Dask cluster ---

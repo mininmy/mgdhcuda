@@ -1,6 +1,8 @@
 import numpy as np
 from numba import cuda, float64
 
+
+
 @cuda.jit
 def compute_XTX_XTy(X, y, XTX, XTy):
     row = cuda.grid(1)
