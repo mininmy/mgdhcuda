@@ -14,8 +14,7 @@ from cuda_least_squares import least_squares_gpu
 
 import matplotlib.pyplot as plt
 from config_constants import MAX_EXP
-from gpu_polynomial_module import PolynomialGPU
-from cuda_least_squares import least_squares_gpu
+
 
 # --- Helper functions ---
 

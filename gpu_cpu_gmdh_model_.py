@@ -33,76 +33,10 @@ from cuda_least_squares import least_squares_gpu
 from pressure_estimator import compute_pressure_from_polynomials
 evaluate_model_pair_delayed = delayed(evaluate_model_pair)
 
-import time
-from contextlib import contextmanager
-from collections import defaultdict
-
-def _sync_gpu():
-    try:
-        cp.cuda.get_current_stream().synchronize()
-    except Exception:
-        pass
-
-class TimeAgg:
-    def __init__(self):
-        self.cpu = defaultdict(float)   # seconds
-        self.gpu = defaultdict(float)   # milliseconds
-
-    @contextmanager
-    def cpu_block(self, key):
-        t0 = time.perf_counter()
-        try:
-            yield
-        finally:
-            self.cpu[key] += (time.perf_counter() - t0)
-
-    @contextmanager
-    def gpu_block(self, key):
-        # measures GPU time using CUDA events
-        start = cp.cuda.Event() if 'cp' in globals() else None
-        end = cp.cuda.Event() if 'cp' in globals() else None
-        if start is not None:
-            _sync_gpu()
-            start.record()
-        try:
-            yield
-        finally:
-            if start is not None:
-                end.record()
-                end.synchronize()
-                self.gpu[key] += cp.cuda.get_elapsed_time(start, end)  # ms
-
-    def report(self):
-        # pretty print in descending order
-        if self.cpu:
-            print("\n=== CPU Timings (s) ===")
-            for k, v in sorted(self.cpu.items(), key=lambda x: -x[1]):
-                print(f"{k:30s} : {v:9.4f}")
-        if self.gpu:
-            print("\n=== GPU Timings (ms) ===")
-            for k, v in sorted(self.gpu.items(), key=lambda x: -x[1]):
-                print(f"{k:30s} : {v:9.2f}")
-        print()
-import time
-from contextlib import contextmanager
-
-class TimerCollection:
-    def __init__(self):
-        self.times = {}
-
-    @contextmanager
-    def cpu_block(self, name):
-        start = time.time()
-        yield
-        end = time.time()
-        self.times[name] = self.times.get(name, 0.0) + (end - start)
-
-    def report(self):
-        print("\n=== Timing Report ===")
-        for k, v in self.times.items():
-            print(f"{k}: {v:.4f} s")
 
 # --- Helper functions ---
+
+import cupy as cp
 
 def gmdh_error_lightweight(X_gpu, U_true_gpu, velocity_polys, pressure_poly=None, nu=0.0, g=None, return_components=False):
     """
@@ -314,8 +248,6 @@ class PhysicsAwareGMDH:
         self.u_dt_cpu = None
         self.u_laplace_cpu = None
 
-        self.timers = TimeAgg()
-
     def _initialize_first_layer(self, n_components):
         return [[
             PolynomialGPU.from_dict({tuple(1 if j == i else 0 for j in range(self.n_features)): 1})
@@ -337,116 +269,6 @@ class PhysicsAwareGMDH:
     
     
     def _least_squares_step(self, pressure_poly, constraints):
-        delayed_tasks = []
-        previous_models = self.models[-1]
-        total_components = len(previous_models)
-
-        X_cpu = self.X_cpu
-
-        with self.timers.cpu_block("eval_u_tensor"):
-            u_tensor_cpu_list = []
-            u_grads_tensor_cpu_list = []
-            for comp_models in previous_models:
-                with self.timers.cpu_block("eval_u_tensor:chunk"):
-                    u_comp = evaluate_models_chunked(comp_models, X_cpu)
-                u_tensor_cpu_list.append(u_comp)
-
-                grads_comp = []
-                for model in comp_models:
-                    grads = []
-                    for d in range(X_cpu.shape[1]):
-                        # Each derivative eval timed (CPU time, includes host->device copies inside helper)
-                        with self.timers.cpu_block("eval_grads:diff_eval"):
-                            grad_vals = evaluate_models_chunked([model.differentiate(d)], X_cpu)[0]
-                        grads.append(grad_vals)
-                    grads_comp.append(np.stack(grads, axis=0))
-                u_grads_tensor_cpu_list.append(np.stack(grads_comp, axis=0))
-
-        u_tensor_cpu = np.stack(u_tensor_cpu_list, axis=0)
-        u_grads_tensor_cpu = np.stack(u_grads_tensor_cpu_list, axis=0)
-
-        with self.timers.cpu_block("eval_dt"):
-            u_dt_cpu_list = []
-            for comp_models in previous_models:
-                dt_comp = []
-                for model in comp_models:
-                    with self.timers.cpu_block("eval_dt:diff_t"):
-                        dt_vals = evaluate_models_chunked(
-                            [model.differentiate(X_cpu.shape[1] - 1)], X_cpu
-                        )[0]
-                    dt_comp.append(dt_vals)
-                u_dt_cpu_list.append(np.stack(dt_comp, axis=0))
-        u_dt_cpu = np.stack(u_dt_cpu_list, axis=0)
-
-        with self.timers.cpu_block("eval_laplace"):
-            u_laplace_cpu_list = []
-            for comp_models in previous_models:
-                laplace_comp = []
-                for model in comp_models:
-                    laplace_terms = []
-                    for d in range(X_cpu.shape[1] - 1):
-                        with self.timers.cpu_block("eval_laplace:second_diff"):
-                            second_derivative = model.differentiate(d).differentiate(d)
-                            vals = evaluate_models_chunked([second_derivative], X_cpu)[0]
-                        laplace_terms.append(vals)
-                    laplace_comp.append(np.sum(np.stack(laplace_terms, axis=0), axis=0))
-                u_laplace_cpu_list.append(np.stack(laplace_comp, axis=0))
-        u_laplace_cpu = np.stack(u_laplace_cpu_list, axis=0)
-
-        with self.timers.cpu_block("to_gpu:big_tensors"):
-            X_gpu = cp.asarray(X_cpu)
-            y_gpu = cp.asarray(self.y_cpu)
-            u_tensor_gpu = cp.asarray(u_tensor_cpu)
-            u_grads_tensor_gpu = cp.asarray(u_grads_tensor_cpu)
-            u_dt_gpu = cp.asarray(u_dt_cpu)
-            u_laplace_gpu = cp.asarray(u_laplace_cpu)
-            _sync_gpu()
-
-        model_state = {
-            'X_cpu': X_cpu,
-            'X_gpu': X_gpu,
-            'y_cpu': self.y_cpu,
-            'y_gpu': y_gpu,
-            'u_tensor_cpu': u_tensor_cpu,
-            'u_grads_tensor_cpu': u_grads_tensor_cpu,
-            'u_tensor_gpu': u_tensor_gpu,
-            'u_grads_tensor_gpu': u_grads_tensor_gpu,
-            'u_dt_gpu': u_dt_gpu,
-            'u_laplace_gpu': u_laplace_gpu,
-            'pressure_poly': pressure_poly,
-            'viscosity': self.viscosity,
-            'constraints': constraints,
-            'build_phi': self._build_phi_matrix,
-            'append_constraint': self._append_constraint,
-            'generate_incompressibility': generate_incompressibility_constraint_refactored,
-            'generate_momentum': generate_momentum_constraint_refactored,
-        }
-
-        with self.timers.cpu_block("build_delayed_tasks"):
-            for comp_idx in range(total_components):
-                models_in_component = previous_models[comp_idx]
-                total_models = len(models_in_component)
-                for idx_a in range(total_models):
-                    for idx_b in range(idx_a + 1, total_models):
-                        for s_idx, k_idx in [(idx_a, idx_b), (idx_b, idx_a)]:
-                            task = evaluate_model_pair_delayed(comp_idx, s_idx, k_idx, model_state)
-                            delayed_tasks.append(task)
-
-        with self.timers.cpu_block("dask_compute_pairs"):
-            results = dask.compute(*delayed_tasks, scheduler='threads')
-
-        candidates, error_vectors, y_preds = [], [], []
-        for res in results:
-            if res is None:
-                continue
-            comp_idx, s_idx, k_idx, coef, error_vec, y_pred_i = res
-            candidates.append((comp_idx, s_idx, k_idx, coef))
-            error_vectors.append(error_vec)
-            y_preds.append(y_pred_i)
-
-        return candidates, error_vectors, y_preds
-
-    def _least_squares_step_(self, pressure_poly, constraints):
         delayed_tasks = []
         previous_models = self.models[-1]
         total_components = len(previous_models)
@@ -552,89 +374,8 @@ class PhysicsAwareGMDH:
 
 
     
+
     def fit(self, X, y, pressure=None, constraints=None):
-        limit = min(1_000_000, X.shape[0])
-        # Safer slicing to avoid T back-and-forth
-        self.X_cpu = np.asarray(X[:limit])
-        self.y_cpu = np.asarray(y[:, :limit])  # shape (n_components, N)
-
-        test_start = limit
-        X_gpu_test = cp.asarray(X[test_start:])
-        y_gpu_test = cp.asarray(y[:, test_start:]).T  # (N_test, n_components)
-        pressure_poly = None
-
-        if self.current_layer == 0:
-            self.models = [self._initialize_first_layer(n_components=y.shape[0])]
-
-        while self.current_layer < self.max_layer:
-            with self.timers.cpu_block("layer_total"):
-                print(f"Layer {self.current_layer + 1} processing...")
-                print(f"GPU free memory: {cp.cuda.runtime.memGetInfo()[0] / 1024**3:.2f} GB / "
-                  f"{cp.cuda.runtime.memGetInfo()[1] / 1024**3:.2f} GB")
-                print(f"RMM currently allocated: {tracked.get_allocated_bytes() / 1e6:.2f} MB")
-
-                candidates, errors, preds = self._least_squares_step(pressure_poly, constraints or {})
-                if not candidates:
-                    break
-
-                new_models = [[] for _ in range(self.y_cpu.shape[0])]
-                physics_errors = []
-                pressures = []
-
-                # candidate loop
-                with self.timers.cpu_block("candidate_loop_total"):
-                    for idx in range(len(candidates)):
-                        comp_idx, s, k, coef = candidates[idx]
-
-                        with self.timers.gpu_block("combine_with_gpu(ms)"):
-                            model = self.models[-1][comp_idx][s].combine_with_gpu(
-                                self.models[-1][comp_idx][k], *coef
-                            )
-
-                        velocities = [
-                            self.models[-1][j][s] if j != comp_idx else model
-                            for j in range(self.y_cpu.shape[0])
-                        ]
-
-                        with self.timers.cpu_block("compute_pressure_poly"):
-                            pressure = compute_pressure_from_polynomials(
-                                velocities, viscosity=self.viscosity
-                            ) if all(p.exponents.size > 0 for p in velocities) else None
-                        pressures.append(pressure)
-
-                        for j in range(y.shape[0]):
-                            new_models[j].append(
-                                self.models[-1][j][s] if j != comp_idx else model
-                            )
-
-                        with self.timers.gpu_block("physics_error_eval(ms)"):
-                            physics_err = gmdh_error_lightweight(
-                            X_gpu_test,
-                            y_gpu_test,
-                            velocity_polys=velocities,
-                            pressure_poly=pressure,
-                            nu=self.viscosity,
-                            g=None
-                        )
-                        physics_errors.append(physics_err)
-
-                physics_errors = np.array(physics_errors)
-                best = np.argsort(physics_errors)[:self.top_models]
-
-                self.err_line.append(float(physics_errors[best[0]]))
-                for i in range(len(new_models)):
-                    new_models[i] = [new_models[i][j] for j in best]
-                print("Appending")
-                self.models.append(new_models)
-                pressure_poly = pressures[best[0]]
-                self.y_pred = [preds[int(best[0])]]
-                self.current_layer += 1
-
-        print("\nTiming summary for this run:")
-        self.timers.report()
-        return self
-
-    def fit_(self, X, y, pressure=None, constraints=None):
         self.X_cpu = np.asarray(X[:1000_000])  # limit to 1 million samples for memory
         self.y_cpu = np.asarray(y.T[:1000_000]).T
         X_gpu_test = cp.asarray(X[1000_000:])  # small test chunk on GPU
@@ -761,7 +502,7 @@ if __name__ == "__main__":
     u1_vals = u1(x, y, t).reshape(-1)
     u2_vals = u2(x, y, t).reshape(-1)
 
-    model = PhysicsAwareGMDH(n_features=3, max_layer=10, top_models=15, viscosity=0.01)
+    model = PhysicsAwareGMDH(n_features=3, max_layer=200, top_models=15, viscosity=0.01)
     model.fit(X, y=np.stack([u1_vals, u2_vals]), pressure=None,
               constraints={"incompressibility": True, "momentum": True})
 

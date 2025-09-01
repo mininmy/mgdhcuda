@@ -1,7 +1,7 @@
 # pressure_estimator.py
 import cupy as cp
 import cudf
-from cuda_poly_multiply import decode_keys   # if decode_keys is in cuda_poly_multiply; otherwise import from your util
+from gpu_polynomial_module import decode_keys   # if decode_keys is in cuda_poly_multiply; otherwise import from your util
 from gpu_polynomial_module import PolynomialGPU, Polynomial  # adjust import path if needed
 from config_constants import MAX_EXP, PRUNE_THRESHOLD
 
@@ -14,36 +14,58 @@ def _ensure_gpu_poly(poly):
     else:
         raise TypeError("poly must be Polynomial or PolynomialGPU")
 
-def sum_polynomials_gpu(polys):
+def sum_polynomials_gpu(polys_or_arrays):
     """
-    Sum a list of PolynomialGPU objects and return a single PolynomialGPU.
-    Uses the same MAX_EXP encoding + cudf grouping used elsewhere.
+    Sum a list of PolynomialGPU objects or raw (exponents, coeffs) tuples/arrays.
+
+    Parameters
+    ----------
+    polys_or_arrays : list
+        List of PolynomialGPU objects OR tuples/lists:
+            (exponents : cupy.ndarray[uint8], coeffs : cupy.ndarray[float64])
+
+    Returns
+    -------
+    PolynomialGPU
+        Combined polynomial with duplicate terms reduced.
     """
-    if not polys:
-        # empty polynomial
-        return PolynomialGPU(cp.zeros((0, 0), dtype=cp.uint8), cp.zeros((0,), dtype=cp.float64))
+    if not polys_or_arrays:
+        return PolynomialGPU(cp.zeros((0, 0), dtype=cp.uint8),
+                              cp.zeros((0,), dtype=cp.float64))
 
-    # ensure all are PolynomialGPU and have same number of vars
-    polys = [_ensure_gpu_poly(p) for p in polys]
-    nvars = polys[0].exponents.shape[1]
-    for p in polys:
-        if p.exponents.shape[1] != nvars:
-            raise ValueError("All polynomials must have the same number of variables")
-
-    # concatenate exponents and coeffs
-    exponents_all = cp.concatenate([p.exponents for p in polys], axis=0)
-    coeffs_all = cp.concatenate([p.coeffs for p in polys], axis=0)
+    # Detect if first element is a PolynomialGPU or raw arrays
+    first = polys_or_arrays[0]
+    if isinstance(first, PolynomialGPU):
+        polys = [_ensure_gpu_poly(p) for p in polys_or_arrays]
+        nvars = polys[0].exponents.shape[1]
+        exponents_all = cp.concatenate([p.exponents for p in polys], axis=0)
+        coeffs_all = cp.concatenate([p.coeffs for p in polys], axis=0)
+    else:
+        # Expect iterable of (exps, coeffs)
+        exponents_list = []
+        coeffs_list = []
+        for exps, coeffs in polys_or_arrays:
+            if exps.shape[0] > 0:
+                exponents_list.append(exps)
+                coeffs_list.append(coeffs)
+        if not exponents_list:
+            return PolynomialGPU(cp.zeros((0, 0), dtype=cp.uint8),
+                                  cp.zeros((0,), dtype=cp.float64))
+        exponents_all = cp.concatenate(exponents_list, axis=0)
+        coeffs_all = cp.concatenate(coeffs_list, axis=0)
+        nvars = exponents_all.shape[1]
 
     if exponents_all.shape[0] == 0:
         return PolynomialGPU(exponents_all, coeffs_all)
 
-    # encode exponents to keys
+    # Encode exponents to keys
     keys_combined = cp.zeros(exponents_all.shape[0], dtype=cp.uint64)
     base = 1
     for i in reversed(range(nvars)):
         keys_combined += exponents_all[:, i].astype(cp.uint64) * base
         base *= MAX_EXP
 
+    # Reduce duplicate terms using cuDF
     df = cudf.DataFrame({'key': keys_combined, 'coeff': coeffs_all})
     reduced = df.groupby('key').agg({'coeff': 'sum'}).reset_index()
 
@@ -51,67 +73,64 @@ def sum_polynomials_gpu(polys):
     return PolynomialGPU(decoded_exponents, reduced['coeff'].to_cupy()).prune(threshold=PRUNE_THRESHOLD)
 
 
-def compute_pressure_from_polynomials(polynomials, viscosity, body_forces=None, time_index=None, weights=None):
+
+def compute_pressure_from_polynomials(polynomials, viscosity, body_forces=None, time_index=None):
     """
     Estimate scalar pressure polynomial from a list of velocity polynomials.
+
+    Weights for integration results are computed as:
+        w = 1 / n
+    where n = number of spatial variables with nonzero exponent (time ignored).
 
     Parameters
     ----------
     polynomials : list of Polynomial or PolynomialGPU
-        List [u_0, u_1, ..., u_{d-1}] of velocity component polynomials.
     viscosity : float
-        Kinematic viscosity nu.
+        Kinematic viscosity ν.
     body_forces : list or None
         Optional list of Polynomial/PolynomialGPU representing body forces f_i.
     time_index : int or None
         Index of time variable in polynomials (if present). If None, skip time derivative.
-    weights : list or None
-        Weights to combine integrated pressure candidates for each i. If None, equal weights are used.
 
     Returns
     -------
     PolynomialGPU
         Estimated pressure polynomial on GPU.
     """
-    # convert to GPU polynomials
+    # Convert to GPU polynomials
     u_polys = [_ensure_gpu_poly(p) for p in polynomials]
     d = len(u_polys)
     nvars = u_polys[0].exponents.shape[1]
 
-    if body_forces is None:
-        body_forces = [None] * d
-    else:
-        body_forces = [None if bf is None else _ensure_gpu_poly(bf) for bf in body_forces]
-
-    if weights is None:
-        weights = [1.0 / d] * d
+    # Prepare body forces
+    #if body_forces is None:
+    #    body_forces = [None] * d
+    #else:
+    #    body_forces = [None if bf is None else _ensure_gpu_poly(bf) for bf in body_forces]
 
     pressure_candidates = []
 
     for i in range(d):
         u_i = u_polys[i]
 
-        # time derivative term (if requested)
+        # Time derivative term
         if time_index is not None:
-            # assume last index is time_index (user-provided)
             dt_poly = u_i.differentiate(time_index)
         else:
-            # no time dependence known => zero polynomial
             dt_poly = PolynomialGPU(cp.zeros((0, nvars), dtype=cp.uint8),
                                      cp.zeros((0,), dtype=cp.float64))
 
-        # convection: sum_j u_j * (du_i/dx_j)
+        # Convection term
         conv_terms = []
         for j in range(d):
             du_i_dj = u_i.differentiate(j)
-            # multiply u_j * du_i_dj (use combine_with_gpu with c3 term = 1)
-            # combine_with_gpu(self, other, c0=0.0, c1=1.0, c2=1.0, c3=1.0)
-            # To get product only: set c1=c2=0, c3=1
-            prod = u_polys[j].combine_with_gpu(du_i_dj, c0=0.0, c1=0.0, c2=0.0, c3=1.0)
+            prod = u_polys[j].combine_with_gpu(
+                du_i_dj, c0=0.0, c1=0.0, c2=0.0, c3=1.0
+            )
             conv_terms.append(prod)
         convection = sum_polynomials_gpu(conv_terms)
 
-        # viscous term: nu * sum_j d^2 u_i / dx_j^2
+        # Viscous term
         laplace_terms = []
         for j in range(d):
             d2 = u_i.differentiate(j).differentiate(j)
@@ -119,48 +138,68 @@ def compute_pressure_from_polynomials(polynomials, viscosity, body_forces=None, 
         laplace = sum_polynomials_gpu(laplace_terms)
         viscous_term = PolynomialGPU(laplace.exponents, laplace.coeffs * float(viscosity))
 
-        # body force term (if provided)
-        bf_term = body_forces[i] if body_forces[i] is not None else PolynomialGPU(cp.zeros((0, nvars), dtype=cp.uint8),
-                                                                                 cp.zeros((0,), dtype=cp.float64))
+        # Body force term
+        bf_term = body_forces[i] if body_forces[i] is not None else PolynomialGPU(
+            cp.zeros((0, nvars), dtype=cp.uint8),
+            cp.zeros((0,), dtype=cp.float64)
+        )
 
-        # total term inside parentheses: dt + convection - viscous - body_force
-        # note sign convention: pressure gradient = - ( ... )
-        # So gradient_i = - ( dt + conv - viscous - f )
+        # Total term: dt + conv − viscous − f
         sum_terms = []
-        # dt (positive)
         if dt_poly.exponents.shape[0] > 0:
             sum_terms.append(dt_poly)
-        # conv (positive)
         if convection.exponents.shape[0] > 0:
             sum_terms.append(convection)
-        # viscous is subtracted: add (-1) * viscous (multiply coefficients)
         if viscous_term.exponents.shape[0] > 0:
-            visc = PolynomialGPU(viscous_term.exponents, -1.0 * viscous_term.coeffs)
-            sum_terms.append(visc)
-        # body force is subtracted
-        if bf_term.exponents.shape[0] > 0:
-            bfneg = PolynomialGPU(bf_term.exponents, -1.0 * bf_term.coeffs)
-            sum_terms.append(bfneg)
+            visc_neg = PolynomialGPU(viscous_term.exponents, -1.0 * viscous_term.coeffs)
+            sum_terms.append(visc_neg)
+        #if bf_term.exponents.shape[0] > 0:
+        #    bf_neg = PolynomialGPU(bf_term.exponents, -1.0 * bf_term.coeffs)
+        #    sum_terms.append(bf_neg)
 
-        # sum up the pieces to total_derivative
         total_derivative = sum_polynomials_gpu(sum_terms)
 
-        # pressure gradient component = - total_derivative
+        # Pressure gradient component = − total_derivative
         pressure_grad_i = PolynomialGPU(total_derivative.exponents, -1.0 * total_derivative.coeffs)
 
-        # integrate w.r.t x_i to get candidate pressure polynomial
+        # Integrate w.r.t. x_i
         p_i = pressure_grad_i.integrate(i)
         pressure_candidates.append(p_i)
 
-    # combine candidates using weights
-    weighted = []
-    for w, pc in zip(weights, pressure_candidates):
-        if pc.exponents.shape[0] > 0 and abs(w) > 0.0:
-            weighted.append(PolynomialGPU(pc.exponents, pc.coeffs * float(w)))
+    # --- Vectorized weighting, output as raw arrays ---
+    all_exps = []
+    all_coeffs = []
 
-    if not weighted:
-        # return empty polynomial
-        return PolynomialGPU(cp.zeros((0, nvars), dtype=cp.uint8), cp.zeros((0,), dtype=cp.float64))
+    for p in pressure_candidates:
+        if p.exponents.shape[0] == 0:
+            continue
 
-    pressure = sum_polynomials_gpu(weighted)
+        exps = p.exponents
+        coeffs = p.coeffs
+
+        # Count nonzero spatial vars (ignore time)
+        if time_index is not None:
+            mask = cp.ones(exps.shape[1], dtype=cp.bool_)
+            mask[time_index] = False
+            n_nonzero = cp.count_nonzero(exps[:, mask], axis=1)
+        else:
+            n_nonzero = cp.count_nonzero(exps, axis=1)
+
+        valid_mask = n_nonzero > 0
+        if not cp.any(valid_mask):
+            continue
+
+        all_exps.append(exps[valid_mask])
+        all_coeffs.append(coeffs[valid_mask] / n_nonzero[valid_mask].astype(cp.float64))
+
+    if not all_exps:
+        return PolynomialGPU(cp.zeros((0, nvars), dtype=cp.uint8),
+                              cp.zeros((0,), dtype=cp.float64))
+
+    all_exps = cp.vstack(all_exps)
+    all_coeffs = cp.concatenate(all_coeffs)
+
+    # Directly pass arrays to sum_polynomials_gpu
+    pressure = sum_polynomials_gpu([(all_exps, all_coeffs)])
     return pressure.prune(threshold=PRUNE_THRESHOLD)
+

@@ -13,8 +13,8 @@ from config_constants import MAX_EXP
 from cuda_least_squares import least_squares_gpu
 # --- Constants ---
 NVARS = 3
-BLOCK_SIZE_X = 8
-BLOCK_SIZE_Y = 8
+BLOCK_SIZE_X = 32
+BLOCK_SIZE_Y = 32
 
 @cuda.jit
 def multivariateMulArbitrarySizedPolsCUDA(exp_C, exp_keys, exp_A, exp_B,

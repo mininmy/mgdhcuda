@@ -88,7 +88,8 @@ class PolynomialGPU:
     def combine_with_gpu(self, other, c0=0.0, c1=1.0, c2=1.0, c3=1.0):
         from cuda_poly_multiply import launch_cuda_kernel
         import cudf
-
+        if len(other.coeffs)==0: return PolynomialGPU(cp.zeros((0, self.exponents.shape[1]), dtype=cp.uint8),
+                                 cp.zeros((0,), dtype=cp.float64))
         exponents_list = []
         coeffs_list = []
 
