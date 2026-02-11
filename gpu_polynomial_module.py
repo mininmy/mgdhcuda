@@ -2,6 +2,8 @@ import cupy as cp
 import cudf
 from collections import defaultdict
 from config_constants import MAX_EXP, PRUNE_THRESHOLD
+import math
+import numpy as np
 # --- Optional: adjust to match your encoding ---
 
 def decode_keys(keys: cp.ndarray, nvars: int, max_exp=MAX_EXP) -> cp.ndarray:
@@ -17,6 +19,31 @@ def decode_keys(keys: cp.ndarray, nvars: int, max_exp=MAX_EXP) -> cp.ndarray:
     
     return exponents
 
+def encode_keys(exponents: cp.ndarray, max_exp=MAX_EXP) -> cp.ndarray:
+    """
+    Encode exponent matrix into unique integer keys.
+
+    Parameters
+    ----------
+    exponents : cp.ndarray
+        Shape (n_terms, n_vars), dtype=uint8.
+    max_exp : int
+        Maximum exponent + 1 (the radix base).
+
+    Returns
+    -------
+    cp.ndarray
+        Shape (n_terms,), dtype=uint64 with encoded keys.
+    """
+    n_terms, nvars = exponents.shape
+    keys = cp.zeros(n_terms, dtype=cp.uint64)
+
+    base = 1
+    for i in reversed(range(nvars)):
+        keys += exponents[:, i].astype(cp.uint64) * base
+        base *= max_exp
+
+    return keys
 
 class Polynomial:
     def __init__(self, expform):
@@ -88,8 +115,13 @@ class PolynomialGPU:
     def combine_with_gpu(self, other, c0=0.0, c1=1.0, c2=1.0, c3=1.0):
         from cuda_poly_multiply import launch_cuda_kernel
         import cudf
-        if len(other.coeffs)==0: return PolynomialGPU(cp.zeros((0, self.exponents.shape[1]), dtype=cp.uint8),
-                                 cp.zeros((0,), dtype=cp.float64))
+
+        if len(self.coeffs) == 0 or len(other.coeffs) == 0:
+            return PolynomialGPU(
+            cp.zeros((0, self.exponents.shape[1]), dtype=cp.uint8),
+            cp.zeros((0,), dtype=cp.float64)
+        )
+
         exponents_list = []
         coeffs_list = []
 
@@ -105,12 +137,12 @@ class PolynomialGPU:
 
         # c3 * self * other (GPU multiply)
         if abs(c3) > 1e-22:
-            result = launch_cuda_kernel(self.exponents, other.exponents,
-                                        self.coeffs, other.coeffs)
-            keys = result[:, 0].astype(cp.uint64)
-            coeffs = c3 * result[:, 1]
-            # Decode keys to exponents later after combining with others
-            # We'll store keys separately for now
+            result = launch_cuda_kernel(
+                self.exponents, other.exponents,
+                self.coeffs, other.coeffs
+            )
+            keys = cp.asarray(result[:, 0], dtype=cp.uint64)
+            coeffs = cp.asarray(c3 * result[:, 1], dtype=cp.float64)
         else:
             keys = cp.zeros((0,), dtype=cp.uint64)
             coeffs = cp.zeros((0,), dtype=cp.float64)
@@ -122,20 +154,18 @@ class PolynomialGPU:
             exponents_list.append(zero_exp)
             coeffs_list.append(zero_coeff)
 
-        # Combine self, other, and constant terms first
+        # Combine self, other, constant terms
         if exponents_list:
-            exponents_all = cp.concatenate(exponents_list, axis=0)
-            coeffs_all = cp.concatenate(coeffs_list, axis=0)
+            exponents_all = cp.concatenate([cp.asarray(e) for e in exponents_list], axis=0)
+            coeffs_all = cp.concatenate([cp.asarray(c) for c in coeffs_list], axis=0)
         else:
             exponents_all = cp.zeros((0, self.exponents.shape[1]), dtype=cp.uint8)
             coeffs_all = cp.zeros((0,), dtype=cp.float64)
 
-        # Now combine with multiplication result
+        # Now merge with multiplication result
         if keys.size > 0:
-            # Decode multiplication keys
             decoded_exp = decode_keys(keys, nvars=self.exponents.shape[1])
-            # Concatenate with previous terms
-            exponents_all = cp.concatenate([exponents_all, decoded_exp], axis=0)
+            exponents_all = cp.concatenate([cp.asarray(exponents_all), cp.asarray(decoded_exp)], axis=0)
             coeffs_all = cp.concatenate([cp.asarray(coeffs_all), cp.asarray(coeffs)], axis=0)
 
         if exponents_all.shape[0] == 0:
@@ -148,11 +178,106 @@ class PolynomialGPU:
             keys_combined += exponents_all[:, i].astype(cp.uint64) * base
             base *= MAX_EXP
 
-        df = cudf.DataFrame({'key': keys_combined, 'coeff': coeffs_all})
+        df = cudf.DataFrame({'key': cp.asarray(keys_combined), 'coeff': cp.asarray(coeffs_all)})
         reduced = df.groupby('key').agg({'coeff': 'sum'}).reset_index()
 
         decoded_exponents = decode_keys(reduced['key'].to_cupy(), nvars=self.exponents.shape[1])
         return PolynomialGPU(decoded_exponents, reduced['coeff'].to_cupy()).prune()
+
+    def _evaluate_monomials_gpu(self, X):
+        """
+        Evaluate each monomial term on X (GPU) and return phi: shape (N, n_terms).
+        - X: cp.ndarray shape (N, n_vars)
+        - returns: phi (N, n_terms) cp.float64
+        """
+        # fast path: zero-term polynomial
+        if self.coeffs.size == 0:
+            return cp.zeros((X.shape[0], 0), dtype=cp.float64)
+
+        n_terms = int(self.exponents.shape[0])
+        N = X.shape[0]
+        phi = cp.ones((N, n_terms), dtype=cp.float64)
+
+        # multiply contributions variable-by-variable
+        # vectorized over samples, loop over variables (n_vars typically small)
+        for var_idx in range(self.exponents.shape[1]):
+            exps = self.exponents[:, var_idx].astype(cp.int32)  # (n_terms,)
+            # if all zero, skip
+            if not int(cp.any(exps)):
+                continue
+            # compute X[:,var_idx] ** exps for all samples and terms in one go:
+            # X[:,var_idx][:,None] ** exps[None,:]
+            phi *= (X[:, var_idx:var_idx+1] ** exps[None, :])
+        return phi
+
+    def evaluate_monomials(self, X):
+        """
+        Evaluate each monomial term (without multiplying by coefficients).
+        Returns CuPy array of shape (N, n_terms).
+        """
+        if isinstance(X, cp.ndarray):
+            return self._evaluate_monomials_gpu(X)
+        else:
+            X_gpu = cp.asarray(X)
+            phi = self._evaluate_monomials_gpu(X_gpu)
+            return cp.asnumpy(phi)
+    
+    def compute_correlations(self, X, y, chunk_size=None):
+        """
+        Compute correlation between each monomial value and output y.
+        Returns CuPy array of shape (n_terms,).
+        """
+        y_gpu = cp.asarray(y).ravel()
+        N = y_gpu.size
+        if chunk_size is None:
+            chunk_size = min(32768, N)
+
+        corrs = []
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            phi = self._evaluate_monomials_gpu(X[start:end])
+            # center
+            phi -= phi.mean(axis=0, keepdims=True)
+            y_c = y_gpu[start:end] - y_gpu[start:end].mean()
+            # correlation numerator
+            num = cp.sum(phi * y_c[:, None], axis=0)
+            # denominator
+            denom = cp.sqrt(cp.sum(phi**2, axis=0) * cp.sum(y_c**2))
+            corr_chunk = cp.nan_to_num(num / denom)
+            corrs.append(corr_chunk)
+        corrs = cp.mean(cp.stack(corrs), axis=0)
+        return corrs
+
+    def remove_terms_mask(self, keep_mask):
+        """Return a new PolynomialGPU keeping only indices where keep_mask==True."""
+        keep_mask = cp.asarray(keep_mask, dtype=bool)
+        return PolynomialGPU(self.exponents[keep_mask], self.coeffs[keep_mask])
+
+    def substitute_term_by_mean(self, idx, phi_j_mean):
+        """
+        Replace term idx by adding coeff[idx] * mean(phi_j) into constant term.
+        Equivalent to removing oscillatory part of the term while keeping its mean effect.
+        This modifies coefficients in place and returns a new PolynomialGPU.
+        """
+        coeffs = self.coeffs.copy()
+        exps = self.exponents.copy()
+        c = coeffs[idx]
+        # find constant term (exponents all zero) or create one
+        zero_mask = cp.all(exps == 0, axis=1)
+        if cp.any(zero_mask):
+            const_idx = int(cp.where(zero_mask)[0][0])
+            coeffs[const_idx] = coeffs[const_idx] + c * float(phi_j_mean)
+        else:
+            # append constant term
+            zero_exp = cp.zeros((1, exps.shape[1]), dtype=exps.dtype)
+            exps = cp.concatenate([exps, zero_exp], axis=0)
+            coeffs = cp.concatenate([coeffs, cp.array([c * float(phi_j_mean)], dtype=coeffs.dtype)])
+        # zero the original coefficient
+        coeffs = coeffs.copy()
+        coeffs[idx] = 0.0
+        return PolynomialGPU(exps, coeffs)
+
+    
 
 
 if __name__ == "__main__":
