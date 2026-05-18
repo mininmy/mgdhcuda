@@ -3,265 +3,204 @@ from numba import cuda, float64
 import cupy as cp
 from math import isnan   
 
-@cuda.jit
-def compute_weighted_XTX_XTy(X, y, weights, XTX, XTy):
-    """
-    CUDA kernel to compute weighted normal equation components:
-        XTX = X^T W X
-        XTy = X^T W y
-    """
-    row = cuda.grid(1)
-    n_rows, n_cols = X.shape
-    if row < n_rows:
-        w = weights[row]
-        if w == 0.0 or isnan(w):  # skip invalid rows
-            return
-        for i in range(n_cols):
-            xi = X[row, i]
-            for j in range(n_cols):
-                cuda.atomic.add(XTX, (i, j), w * xi * X[row, j])
-            cuda.atomic.add(XTy, i, w * xi * y[row])
-
-
-def weighted_least_squares_with_errors_gpu(X, y, weights, group_bounds):
-    """
-    Solve weighted least squares on GPU and compute per-group weighted squared errors.
-
-    Parameters
-    ----------
-    X : cp.ndarray, shape (n_rows, n_cols)
-    y : cp.ndarray, shape (n_rows,)
-    weights : cp.ndarray, shape (n_rows,)
-        Row-wise scalar weights (typically from constraint scaling)
-    group_bounds : dict[str, tuple[int, int]]
-        Slice bounds per group, e.g.:
-        {
-            'data': (0, n_data),
-            'incomp': (n_data, n_data + n_incomp),
-            'momentum': (n_data + n_incomp, n_total)
-        }
-
-    Returns
-    -------
-    beta : cp.ndarray, (n_cols,)
-        Regression coefficients.
-    group_errors : dict[str, float]
-        Weighted mean squared error per group.
-    """
-
-    n_rows, n_cols = X.shape
-    
-    # --- 1. Compute X^T W X and X^T W y ---
-    XTX = cp.zeros((n_cols, n_cols), dtype=cp.float64)
-    XTy = cp.zeros(n_cols, dtype=cp.float64)
-    
-    threads_per_block = 256
-    blocks_per_grid = (n_rows + threads_per_block - 1) // threads_per_block
-
-    compute_weighted_XTX_XTy[blocks_per_grid, threads_per_block](X, y, weights, XTX, XTy)
-    cuda.synchronize()
-    
-    # --- 2. Solve for beta ---
-    # Add small diagonal regularization for numerical stability
-    reg = 1e-12
-    beta = cp.linalg.solve(XTX + reg * cp.eye(n_cols), XTy)
-
-    # --- 3. Compute residuals and per-group weighted MSEs ---
-    residuals = X @ beta - y
-    group_errors = {}
-    
-    for key, (start, end) in group_bounds.items():
-        if end <= start:
-            group_errors[key] = 0.0
-            continue
-        r = residuals[start:end]
-        w = weights[start:end]
-
-        # Weighted MSE (normalize by sum of weights to keep scale consistent)
-        mse = cp.sum((w * r) ** 2) / cp.sum(w)
-        group_errors[key] = float(mse)
-
-    return beta, group_errors
-
-def weighted_least_squares_gpu(blocks, weights, chunk_size=100000):
-    """
-    Compute weighted least squares solution:
-        sum_i (w_i * A_i^T A_i) beta = sum_i (w_i * A_i^T b_i)
-    Each A_i, b_i are GPU/CPU arrays.
-    """
-    # Assume all blocks share the same number of columns
-    n_cols = blocks[0][0].shape[1]
-    XTX_host = np.zeros((n_cols, n_cols), dtype=np.float64)
-    XTy_host = np.zeros(n_cols, dtype=np.float64)
-
-    threads_per_block = 256
-    blocks_per_grid = (chunk_size + threads_per_block - 1) // threads_per_block
-
-    for (A_host, b_host), w in zip(blocks, weights):
-        n_rows = A_host.shape[0]
-        for i in range(0, n_rows, chunk_size):
-            end = min(i + chunk_size, n_rows)
-            A_chunk = A_host[i:end]
-            b_chunk = b_host[i:end]
-
-            d_A = cuda.to_device(A_chunk)
-            d_b = cuda.to_device(b_chunk)
-            d_XTX = cuda.to_device(np.zeros((n_cols, n_cols), dtype=np.float64))
-            d_XTy = cuda.to_device(np.zeros(n_cols, dtype=np.float64))
-
-            compute_weighted_XTX_XTy[blocks_per_grid, threads_per_block](d_A, d_b, d_XTX, d_XTy, w)
-
-            XTX_host += d_XTX.copy_to_host()
-            XTy_host += d_XTy.copy_to_host()
-
-    beta = np.linalg.solve(XTX_host, XTy_host)
-    return beta
-
 
 @cuda.jit
-def compute_XTX_XTy(X, y, XTX, XTy):
-    row = cuda.grid(1)
-    n_rows, n_cols = X.shape
-    if row < n_rows:
-        for i in range(n_cols):
-            xi = X[row, i]
-            for j in range(n_cols):
-                cuda.atomic.add(XTX, (i, j), xi * X[row, j])
-            cuda.atomic.add(XTy, i, xi * y[row])
+def selective_winner_vector_hash_kernel(
+    all_exps, all_coeffs, in_offsets,
+    winner_map_sk,
+    out_exps, out_coeffs, out_sizes,
+    n_vars, n_winners
+):
+    winner_idx = cuda.blockIdx.x
+    if winner_idx >= n_winners: return
 
-# keep your existing imports
-import numpy as np
-from numba import cuda, float64
+    # --- 1. Параметры Хеша ---
+    HASH_SIZE = 1024
+    EMPTY = 255 # Маркер пустого слота (для uint8)
+    
+    # Резервируем Shared Memory
+    # (HASH_SIZE, 8) для экспонент, (HASH_SIZE) для коэффициентов
+    s_exps = cuda.shared.array(shape=(1024, 8), dtype=np.uint8)
+    s_vals = cuda.shared.array(shape=(1024), dtype=np.float64)
+    s_lock = cuda.shared.array(shape=(1024), dtype=np.int32) # Для атомарного захвата
 
-# --- your existing kernel must remain unchanged and available ---
-# compute_XTX_XTy(X, y, XTX, XTy)  # already in your code
+    s_local_count = cuda.shared.array(1, dtype=np.int32)
+    s_overflow = cuda.shared.array(1, dtype=np.int32)
 
-# Helper: vertically concatenate & scale blocks (host-side)
-def concat_and_scale_blocks(blocks, weights):
-    """
-    blocks: list of (A_block, b_block) where A_block: (n_rows, n_cols) numpy,
-            b_block: (n_rows,) numpy
-    weights: list of floats, same length as blocks
+    tid = cuda.threadIdx.x
+    
+    # Инициализация всей таблицы
+    for i in range(tid, HASH_SIZE, cuda.blockDim.x):
+        s_lock[i] = 0
+        s_vals[i] = 0.0
+        for d in range(n_vars):
+            s_exps[i, d] = EMPTY
+            
+    if tid == 0:
+        s_local_count[0] = 0
+        s_overflow[0] = 0
+    cuda.syncthreads()
 
-    Return: concatenated A (n_total_rows, n_cols), b (n_total_rows,)
-    scaled by sqrt(weights[i]).
-    """
-    assert len(blocks) == len(weights)
-    # if all weights zero -> return empty arrays
-    if all((w == 0 or b is None) for (A, b), w in zip(blocks, weights)):
-        n_cols = blocks[0][0].shape[1]  # assume at least one block exists
-        return np.empty((0, n_cols), dtype=np.float64), np.empty((0,), dtype=np.float64)
+    # --- 2. Multiply + Vector Hash ---
+    s_id, k_id = winner_map_sk[winner_idx, 1], winner_map_sk[winner_idx, 2]
+    start_s, nA = in_offsets[s_id], in_offsets[s_id+1] - in_offsets[s_id]
+    start_k, nB = in_offsets[k_id], in_offsets[k_id+1] - in_offsets[k_id]
 
-    A_parts = []
-    b_parts = []
-    for (A, b), w in zip(blocks, weights):
-        if A is None or b is None:
-            continue
-        if w == 0.0:
-            continue
-        s = np.sqrt(w)
-        # Cast to float64 (kernel expects float64)
-        A_scaled = (A.astype(np.float64, copy=False) * s)
-        b_scaled = (b.astype(np.float64, copy=False) * s)
-        A_parts.append(A_scaled)
-        b_parts.append(b_scaled)
-    if not A_parts:
-        # no active blocks
-        n_cols = blocks[0][0].shape[1]
-        return np.empty((0, n_cols), dtype=np.float64), np.empty((0,), dtype=np.float64)
+    for idx in range(tid, nA * nB, cuda.blockDim.x):
+        i, j = idx % nA, idx // nA
+        c_prod = all_coeffs[start_s + i] * all_coeffs[start_k + j]
+        if abs(c_prod) < 1e-13: continue
 
-    A_concat = np.vstack(A_parts)
-    b_concat = np.concatenate(b_parts)
-    return A_concat, b_concat
+        # Локальный вектор текущих экспонент
+        curr_e = cuda.local.array(8, dtype=np.uint8)
+        h = np.uint32(0)
+        for d in range(n_vars):
+            e_sum = all_exps[start_s + i, d] + all_exps[start_k + j, d]
+            curr_e[d] = e_sum
+            # Lightweight Hash (Jenkins-style)
+            h = (h + e_sum) + (h << 10)
+            h ^= (h >> 6)
+        
+        h = (h + (h << 3)) ^ (h >> 11)
+        h = (h + (h << 15)) % HASH_SIZE
+
+        inserted = False
+        for attempt in range(HASH_SIZE):
+            # АТОМАРНЫЙ ЗАХВАТ СЛОТА (Locking)
+            # Если 0 -> меняем на 1. Если уже 1 -> проверяем на совпадение.
+            res = cuda.atomic.compare_and_swap(s_lock, h, 0, 1)
+            
+            if res == 0: # Мы первые захватили слот!
+                for d in range(n_vars): s_exps[h, d] = curr_e[d]
+                cuda.atomic.add(s_vals, h, c_prod)
+                inserted = True
+                break
+            else: # Слот уже занят, проверяем: наш ли это вектор?
+                match = True
+                for d in range(n_vars):
+                    if s_exps[h, d] != curr_e[d]:
+                        match = False
+                        break
+                if match:
+                    cuda.atomic.add(s_vals, h, c_prod)
+                    inserted = True
+                    break
+            
+            h = (h + 1) % HASH_SIZE # Линейное пробирование
+            
+        if not inserted: s_overflow[0] = 1
+
+    cuda.syncthreads()
+
+    # --- 3. Parallel Write-Back ---
+    base_out = winner_idx * HASH_SIZE
+    if s_overflow[0] == 0:
+        for i in range(tid, HASH_SIZE, cuda.blockDim.x):
+            if s_lock[i] == 1 and abs(s_vals[i]) > 1e-12:
+                idx_to_write = cuda.atomic.add(s_local_count, 0, 1)
+                for d in range(n_vars):
+                    out_exps[base_out + idx_to_write, d] = s_exps[i, d]
+                out_coeffs[base_out + idx_to_write] = s_vals[i]
+
+    cuda.syncthreads()
+    if tid == 0:
+        out_sizes[winner_idx] = -1 if s_overflow[0] == 1 else s_local_count[0]
+
+@cuda.jit(device=True)
+def calc_jacobian_row_nd(sp, sdt, ls_grad, slap, 
+                         kp, kdt, lk_grad, klap, 
+                         u_b, pos, du_i_dx_i, 
+                         nu, w_dat, w_div, w_mom, 
+                         i_comp, n_dim, A):
+    # Попереднє обчислення для економії ~1.8 млрд інструкцій на шар
+    sp2 = sp * sp
+    kp2 = kp * kp
+    sk  = sp * kp
+    sk_dt = sdt * kp + sp * kdt
+    
+    conv_s, conv_k, sk_conv = 0.0, 0.0, 0.0
+    dot_grad_sk, dot_grad_ss, dot_grad_kk = 0.0, 0.0, 0.0
+    
+    for d in range(n_dim):
+        gs, gk, ub = ls_grad[d], lk_grad[d], u_b[d, pos]
+        conv_s += ub * gs
+        conv_k += ub * gk
+        sk_conv += ub * (gs * kp + sp * gk)
+        dot_grad_sk += gs * gk
+        dot_grad_ss += gs * gs
+        dot_grad_kk += gk * gk
+
+    sk_lap = slap * kp + sp * klap + 2.0 * dot_grad_sk
+    s2_lap = 2.0 * dot_grad_ss + 2.0 * sp * slap
+    k2_lap = 2.0 * dot_grad_kk + 2.0 * kp * klap
+
+    # Формування 6 колонок Якобіана (A_j = Data + Div + Mom)
+    A[0] = (1.0 * w_dat) + (sp * du_i_dx_i * w_mom)
+    A[1] = (sp * w_dat) + (ls_grad[i_comp] * w_div) + ((sdt + conv_s + sp * du_i_dx_i - nu * slap) * w_mom)
+    A[2] = (kp * w_dat) + (lk_grad[i_comp] * w_div) + ((kdt + conv_k + kp * du_i_dx_i - nu * klap) * w_mom)
+    A[3] = (sk * w_dat) + ((ls_grad[i_comp]*kp + sp*lk_grad[i_comp]) * w_div) + ((sk_dt + sk_conv + sk * du_i_dx_i - nu * sk_lap) * w_mom)
+    A[4] = (sp2 * w_dat) + (2.0 * sp * ls_grad[i_comp] * w_div) + ((2.0 * sp * sdt + 2.0 * sp * conv_s + sp2 * du_i_dx_i - nu * s2_lap) * w_mom)
+    A[5] = (kp2 * w_dat) + (2.0 * kp * lk_grad[i_comp] * w_div) + ((2.0 * kp * kdt + 2.0 * kp * conv_k + kp2 * du_i_dx_i - nu * k2_lap) * w_mom)
 
 
-def least_squares_weighted_gpu(blocks, weights, chunk_size=100_000, threads_per_block=256):
-    """
-    blocks: list of (A_block, b_block) host (numpy) arrays.
-    weights: list of floats (same length)
-    This function concatenates scaled blocks and uses your GPU kernel compute_XTX_XTy
-    to compute XTX and XTy in chunks, then solves the normal equations.
-    Returns: beta (1D numpy array) of length n_cols.
-    """
-    # Prepare scaled concatenated design and target
-    X_all, y_all = concat_and_scale_blocks(blocks, weights)
-    n_rows, n_cols = X_all.shape
 
-    # Edge case: nothing to solve
-    if n_rows == 0:
-        return np.zeros((n_cols,), dtype=np.float64)
+@cuda.jit
+def gmdh_flat_fused_kernel(
+    all_phi, all_dt, all_grad, all_lap,
+    u_b, du_i_dx_i, pg_i, y_t,
+    alphas, nu, w_dat, w_div, w_mom,
+    s_idx, i_comp, n_dim, curr_n, n_ks, k_map,
+    out_XTX, out_XTy, out_mse
+):
+    # Глобальний індекс роботи (0 ... curr_n * n_ks - 1)
+    idx = cuda.grid(1)
+    
+    if idx < curr_n * n_ks:
+        # Розпаковуємо: яку точку (pos) і яку модель K рахує цей потік
+        k_local_idx = idx // curr_n
+        pos = idx % curr_n
+        
+        # 1. ЗАВАНТАЖЕННЯ ДАНИХ (Registers)
+        # S-база
+        sp = all_phi[s_idx, i_comp, pos]
+        sdt = all_dt[s_idx, i_comp, pos]
+        slap = all_lap[s_idx, i_comp, pos]
+        dudx_ii = du_i_dx_i[pos]
+        
+        # K-модель
+        kp = all_phi[k_local_idx, i_comp, pos]
+        kdt = all_dt[k_local_idx, i_comp, pos]
+        klap = all_lap[k_local_idx, i_comp, pos]
 
-    # allocate accumulators
-    XTX_host = np.zeros((n_cols, n_cols), dtype=np.float64)
-    XTy_host = np.zeros((n_cols,), dtype=np.float64)
+        # Градієнти (Local Arrays)
+        ls_grad = cuda.local.array(3, dtype=np.float64)
+        lk_grad = cuda.local.array(3, dtype=np.float64)
+        for d in range(n_dim): 
+            ls_grad[d] = all_grad[s_idx, i_comp, d, pos]
+            lk_grad[d] = all_grad[k_local_idx, i_comp, d, pos]
 
-    threads = threads_per_block
-    # blocks_per_grid computed by chunk_size (we reuse kernel-grid computation)
-    for start in range(0, n_rows, chunk_size):
-        end = min(start + chunk_size, n_rows)
-        X_chunk = X_all[start:end]
-        y_chunk = y_all[start:end]
+        # 2. РОЗРАХУНОК НЕВЯЗОК (Residuals)
+        conv_s = 0.0
+        for d in range(n_dim): conv_s += u_b[d, pos] * ls_grad[d]
+        
+        res_w = (sp - y_t[pos]) * w_dat + ls_grad[i_comp] * w_div + (sdt + conv_s - nu * slap + pg_i[pos]) * w_mom
+        b_train, b_eval = -res_w, res_w
 
-        # prepare device arrays
-        d_X = cuda.to_device(X_chunk)
-        d_y = cuda.to_device(y_chunk)
-        d_XTX = cuda.to_device(np.zeros((n_cols, n_cols), dtype=np.float64))
-        d_XTy = cuda.to_device(np.zeros((n_cols,), dtype=np.float64))
+        # 3. РОЗРАХУНОК ЯКОБІАНА
+        A = cuda.local.array(6, dtype=np.float64)
+        calc_jacobian_row_nd(sp, sdt, ls_grad, slap, kp, kdt, lk_grad, klap, 
+                             u_b, pos, dudx_ii, nu, w_dat, w_div, w_mom, i_comp, n_dim, A)
 
-        # compute blocks per grid for current chunk length
-        rows_cur = X_chunk.shape[0]
-        blocks_per_grid = (rows_cur + threads - 1) // threads
-
-        # run kernel
-        compute_XTX_XTy[blocks_per_grid, threads](d_X, d_y, d_XTX, d_XTy)
-
-        # accumulate
-        XTX_host += d_XTX.copy_to_host()
-        XTy_host += d_XTy.copy_to_host()
-
-    # Solve XTX beta = XTy - with small regularization for numerical stability
-    # Regularization lambda small (1e-12) to handle near-singular systems
-    reg = 1e-12
-    try:
-        beta = np.linalg.solve(XTX_host + reg * np.eye(n_cols, dtype=np.float64), XTy_host)
-    except np.linalg.LinAlgError:
-        # fallback to least-squares solve (stable)
-        beta, *_ = np.linalg.lstsq(XTX_host + reg * np.eye(n_cols, dtype=np.float64), XTy_host, rcond=None)
-    return beta
-
-
-
-def least_squares_gpu(X_host, y_host, chunk_size=100000):
-    n_rows, n_cols = X_host.shape
-
-    XTX_host = np.zeros((n_cols, n_cols), dtype=np.float64)
-    XTy_host = np.zeros(n_cols, dtype=np.float64)
-
-    threads_per_block = 256
-    blocks_per_grid = (chunk_size + threads_per_block - 1) // threads_per_block
-
-    for i in range(0, n_rows, chunk_size):
-        end = min(i + chunk_size, n_rows)
-        X_chunk = X_host[i:end]
-        y_chunk = y_host[i:end]
-
-        d_X = cuda.to_device(X_chunk)
-        d_y = cuda.to_device(y_chunk)
-        d_XTX = cuda.to_device(np.zeros((n_cols, n_cols), dtype=np.float64))
-        d_XTy = cuda.to_device(np.zeros(n_cols, dtype=np.float64))
-
-        compute_XTX_XTy[blocks_per_grid, threads_per_block](d_X, d_y, d_XTX, d_XTy)
-
-        XTX_host += d_XTX.copy_to_host()
-        XTy_host += d_XTy.copy_to_host()
-
-    beta = np.linalg.solve(XTX_host, XTy_host)
-    return beta
-
-# Example usage:
-if __name__ == "__main__":
-    np.random.seed(0)
-    X = np.random.rand(10**6, 4)
-    y = np.random.rand(10**6)
-    beta = least_squares_gpu(X, y)
-    print("Beta:", beta)
+        # 4. АКУМУЛЯЦІЯ (Atomic Global)
+        k_real_idx = k_map[k_local_idx]
+        
+        # Тренування
+        for r in range(6):
+            cuda.atomic.add(out_XTy, (s_idx, k_real_idx, i_comp, r, 0), A[r] * b_train)
+            for c in range(r, 6):
+                cuda.atomic.add(out_XTX, (s_idx, k_real_idx, i_comp, r, c), A[r] * A[c])
+        
+        # Валідація
+        res_f = b_eval
+        for j in range(6): res_f += alphas[k_local_idx, j] * A[j]
+        cuda.atomic.add(out_mse, (s_idx, k_real_idx, i_comp), res_f * res_f)

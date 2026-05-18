@@ -205,23 +205,21 @@ class GMDHTrainerGPU:
         self.current_models = self._initialize_layer_zero()
         best_rmse = float('inf'); best_layer = -1
         prev_avg_rmse = float('inf')
-        _model_weights = None  # ensemble pressure weights; uniform for layer 0
 
         for layer in range(n_layers):
             t_start = time.time()
             all_pg_polys = self._compute_pressure_grad_polys()
-            candidates, current_rmse = self._train_and_eval_layer(X_tr, y_tr, all_pg_polys, _model_weights)
+            candidates, current_rmse = self._train_and_eval_layer(X_tr, y_tr, all_pg_polys)
             t_layer = time.time() - t_start
 
             # Each candidate changes only one component (ic). Score by:
             #   combined_err = (fitted_err_ic + sum of current RMSE for other
             #                   components from parent model s) / n_comp
             # This accounts for the unchanged components' quality during selection.
-            _w_dat = float(self.weights['data'])
             for c in candidates:
                 s_idx = c['s']
                 ic    = c['i']
-                other = sum(_w_dat * float(current_rmse[s_idx, ic2])
+                other = sum(float(current_rmse[s_idx, ic2])
                             for ic2 in range(self.n_comp) if ic2 != ic)
                 c['combined_err'] = (c['err'] + other) / self.n_comp
 
@@ -248,9 +246,6 @@ class GMDHTrainerGPU:
             best_rmse = layer_rmse; best_layer = layer
             prev_avg_rmse = avg_rmse
             self.current_models = self._assemble(winners)
-            # Update ensemble pressure weights for the next layer.
-            _w = np.array([1.0 / (w['combined_err'] + 1e-12) for w in winners])
-            _model_weights = _w / _w.sum()
             cp.get_default_memory_pool().free_all_blocks()
 
         print(f"Training complete. Best RMSE: {best_rmse:.6e} at layer {best_layer}.")
@@ -313,7 +308,7 @@ class GMDHTrainerGPU:
         return (cp.abs(corr) < cp.float64(threshold)).get()
 
     # ------------------------------------------------------------------
-    def _train_and_eval_layer(self, X, y, all_pg_polys, model_weights=None):
+    def _train_and_eval_layer(self, X, y, all_pg_polys):
         n_total  = X.shape[0]; n_models = len(self.current_models)
         n_dim    = self.n_vars - 1; n_ks = n_models - 1
         n_sys    = n_models * n_ks * self.n_comp
@@ -350,34 +345,21 @@ class GMDHTrainerGPU:
         kr_gpu     = cp.asarray(kr_arr, dtype=cp.int32)
         ic_clamped = cp.minimum(ic_gpu, cp.int32(n_dim - 1))
 
-        # Ensemble pressure gradient weights: inverse-error over models, normalized.
-        if model_weights is not None and len(model_weights) == n_models:
-            _pw = cp.asarray(model_weights, dtype=cp.float64)
-            _pg_weights = _pw / _pw.sum()
-        else:
-            _pg_weights = cp.full(n_models, 1.0 / n_models, dtype=cp.float64)
-
         curr_sq = cp.zeros((n_models, self.n_comp), dtype=cp.float64)
 
-        w_dat = np.float64(self.weights['data'])
-        w_div = np.float64(self.weights['div'])
-        w_mom = np.float64(self.weights['mom'])
-
-        # sum_lin / sum_non stored *unweighted*; w_dat applied when building
-        # the combined solve arrays. Only the data term has a non-zero constant column.
-        sum_b   = cp.zeros(n_sys,      dtype=cp.float64)
-        sum_lin = cp.zeros((n_sys, 2), dtype=cp.float64)
-        sum_non = cp.zeros((n_sys, 3), dtype=cp.float64)
-
-        # Per-physics unweighted normal equations — needed to compute per-physics
-        # RMSE after the solve, enabling score = Σ_p w_p * rmse_p for selection.
-        _ptags = [t for t, w in (('dat', w_dat), ('div', w_div), ('mom', w_mom)) if w > 0.0]
-        bsq_p     = {t: cp.zeros(n_sys,         dtype=cp.float64) for t in _ptags}
-        XTX_lin_p = {t: cp.zeros((n_sys, 2, 2), dtype=cp.float64) for t in _ptags}
-        XTy_lin_p = {t: cp.zeros((n_sys, 2),    dtype=cp.float64) for t in _ptags}
-        XTX_non_p = {t: cp.zeros((n_sys, 3, 3), dtype=cp.float64) for t in _ptags}
-        XTy_non_p = {t: cp.zeros((n_sys, 3),    dtype=cp.float64) for t in _ptags}
-        XTX_nl_p  = {t: cp.zeros((n_sys, 3, 2), dtype=cp.float64) for t in _ptags}
+        # Three-stage estimation order:
+        #   1) alpha_0 (intercept)
+        #   2) linear terms only: [s, k]
+        #   3) nonlinear terms:   [sk, s^2, k^2]
+        sum_b   = cp.zeros(n_sys,         dtype=cp.float64)  # Σ b
+        bsq     = cp.zeros(n_sys,         dtype=cp.float64)  # ||b||^2
+        XTX_lin = cp.zeros((n_sys, 2, 2), dtype=cp.float64)  # [s,k]^T [s,k]
+        XTy_lin = cp.zeros((n_sys, 2),    dtype=cp.float64)  # [s,k]^T b
+        sum_lin = cp.zeros((n_sys, 2),    dtype=cp.float64)  # Σ [s,k]
+        XTX_non = cp.zeros((n_sys, 3, 3), dtype=cp.float64)  # [sk,ss,kk]^T [...]
+        XTy_non = cp.zeros((n_sys, 3),    dtype=cp.float64)  # [sk,ss,kk]^T b
+        sum_non = cp.zeros((n_sys, 3),    dtype=cp.float64)  # Σ [sk,ss,kk]
+        XTX_non_lin = cp.zeros((n_sys, 3, 2), dtype=cp.float64)  # non^T lin
 
         for start in range(0, n_total, self.chunk_size):
             slc    = slice(start, min(start + self.chunk_size, n_total))
@@ -389,8 +371,6 @@ class GMDHTrainerGPU:
                 for d in range(n_dim):
                     if pg_model[d].exponents.shape[0] > 0:
                         pg_all[m_idx, d] = pg_model[d].evaluate(X_c)
-            # Ensemble pressure gradient: weighted sum over models → [n_dim, curr_n]
-            pg_ens = (_pg_weights[:, None, None] * pg_all).sum(axis=0)
             y_true = cp.stack(y_c, axis=0)
             diff = phi_all - y_true[None, :, :]   # [n_models, n_comp, curr_n]
             curr_sq += (diff * diff).sum(axis=2)   # [n_models, n_comp]
@@ -399,61 +379,34 @@ class GMDHTrainerGPU:
                 sl = slice(sub_s, min(sub_s + self.qr_sub_size, curr_n))
                 for ss in range(0, n_sys, self.jac_sys_chunk):
                     se = min(ss + self.jac_sys_chunk, n_sys)
-                    J_dat, J_div, J_mom, b_dat, b_div, b_mom = \
-                        self._compute_jacobian_rows_vectorized(
-                            phi_all[:, :, sl], dt_all[:, :, sl],
-                            grad_all[:, :, :, sl], lap_all[:, :, sl],
-                            pg_ens[:, sl], y_true[:, sl],
-                            s_gpu[ss:se], kr_gpu[ss:se],
-                            ic_gpu[ss:se], ic_clamped[ss:se], n_dim)
-                    sum_b[ss:se]   += b_dat.sum(axis=1)
-                    sum_lin[ss:se] += J_dat[:, :, 1:3].sum(axis=1)
-                    sum_non[ss:se] += J_dat[:, :, 3:6].sum(axis=1)
-                    for _tag, J_t, b_t in (('dat', J_dat, b_dat),
-                                           ('div', J_div, b_div),
-                                           ('mom', J_mom, b_mom)):
-                        if _tag not in bsq_p:
-                            continue
-                        J_lin_t = J_t[:, :, 1:3]; J_non_t = J_t[:, :, 3:6]
-                        J_lin_T = J_lin_t.transpose(0, 2, 1)
-                        J_non_T = J_non_t.transpose(0, 2, 1)
-                        JlJl = J_lin_T @ J_lin_t
-                        JnJn = J_non_T @ J_non_t
-                        bsq_p[_tag][ss:se]     += (b_t * b_t).sum(axis=1)
-                        XTX_lin_p[_tag][ss:se] += JlJl
-                        XTy_lin_p[_tag][ss:se] += (J_lin_T @ b_t[:, :, None])[:, :, 0]
-                        XTX_non_p[_tag][ss:se] += JnJn
-                        XTy_non_p[_tag][ss:se] += (J_non_T @ b_t[:, :, None])[:, :, 0]
-                        XTX_nl_p[_tag][ss:se]  += J_non_T @ J_lin_t
-                    del J_dat, J_div, J_mom, b_dat, b_div, b_mom
-            del phi_all, dt_all, grad_all, lap_all, pg_all, pg_ens, y_true
+                    J_sub, b_sub = self._compute_jacobian_rows_vectorized(
+                        phi_all[:, :, sl], dt_all[:, :, sl],
+                        grad_all[:, :, :, sl], lap_all[:, :, sl],
+                        pg_all[:, :, sl], y_true[:, sl],
+                        s_gpu[ss:se], kr_gpu[ss:se],
+                        ic_gpu[ss:se], ic_clamped[ss:se], n_dim)
+                    J_lin = J_sub[:, :, 1:3]  # [s, k]
+                    J_non = J_sub[:, :, 3:6]  # [sk, ss, kk]
+                    J_lin_T = J_lin.transpose(0, 2, 1)
+                    J_non_T = J_non.transpose(0, 2, 1)
+                    XTX_lin[ss:se] += J_lin_T @ J_lin
+                    XTy_lin[ss:se] += (J_lin_T @ b_sub[:, :, None])[:, :, 0]
+                    sum_lin[ss:se] += J_lin.sum(axis=1)
+                    XTX_non[ss:se] += J_non_T @ J_non
+                    XTy_non[ss:se] += (J_non_T @ b_sub[:, :, None])[:, :, 0]
+                    sum_non[ss:se] += J_non.sum(axis=1)
+                    XTX_non_lin[ss:se] += J_non_T @ J_lin
+                    sum_b[ss:se] += b_sub.sum(axis=1)
+                    bsq[ss:se] += (b_sub * b_sub).sum(axis=1)
+                    del J_sub, b_sub
+            del phi_all, dt_all, grad_all, lap_all, pg_all, y_true
             cp.get_default_memory_pool().free_all_blocks()
-
-        # Build combined weighted normal equations for the solve
-        _wtag_all = [('dat', w_dat), ('div', w_div), ('mom', w_mom)]
-        XTX_lin     = cp.zeros((n_sys, 2, 2), dtype=cp.float64)
-        XTy_lin     = cp.zeros((n_sys, 2),    dtype=cp.float64)
-        XTX_non     = cp.zeros((n_sys, 3, 3), dtype=cp.float64)
-        XTy_non     = cp.zeros((n_sys, 3),    dtype=cp.float64)
-        XTX_non_lin = cp.zeros((n_sys, 3, 2), dtype=cp.float64)
-        bsq         = cp.zeros(n_sys,          dtype=cp.float64)
-        for _t, _w in _wtag_all:
-            if _t not in bsq_p:
-                continue
-            XTX_lin     += _w * XTX_lin_p[_t]
-            XTy_lin     += _w * XTy_lin_p[_t]
-            XTX_non     += _w * XTX_non_p[_t]
-            XTy_non     += _w * XTy_non_p[_t]
-            XTX_non_lin += _w * XTX_nl_p[_t]
-            bsq         += _w * bsq_p[_t]
-        sum_lin_w = w_dat * sum_lin  # weighted cross-term for solve
-        sum_non_w = w_dat * sum_non
 
         # ---- Solve in required order: alpha_0, linear, nonlinear ----
         alpha_0 = sum_b / max(n_total, 1)
 
         XTX_lin = (XTX_lin + XTX_lin.transpose(0, 2, 1)) * cp.float64(0.5)
-        XTy_lin_c = XTy_lin - alpha_0[:, None] * sum_lin_w
+        XTy_lin_c = XTy_lin - alpha_0[:, None] * sum_lin
         U1, s1, Vh1 = cp.linalg.svd(XTX_lin, full_matrices=False)
         s1_max = s1.max(axis=-1, keepdims=True)
         s1_inv = cp.where(s1 > self.svd_rcond * s1_max,
@@ -463,7 +416,7 @@ class GMDHTrainerGPU:
         alpha_lin = alpha_lin[:, :, 0]   # [n_sys, 2] -> [s, k]
 
         XTX_non = (XTX_non + XTX_non.transpose(0, 2, 1)) * cp.float64(0.5)
-        XTy_non_c = XTy_non - alpha_0[:, None] * sum_non_w \
+        XTy_non_c = XTy_non - alpha_0[:, None] * sum_non \
                     - (XTX_non_lin @ alpha_lin[:, :, None])[:, :, 0]
         U2, s2, Vh2 = cp.linalg.svd(XTX_non, full_matrices=False)
         s2_max = s2.max(axis=-1, keepdims=True)
@@ -476,37 +429,28 @@ class GMDHTrainerGPU:
         # Final alpha order: [a0, a_s, a_k, a_sk, a_ss, a_kk]
         alphas_gpu = cp.concatenate([alpha_0[:, None], alpha_lin, alpha_non], axis=1)
 
-        # Per-physics RMSE for candidate scoring (no second data pass).
-        # score = w_dat * rmse_dat + w_div * rmse_div + w_mom * rmse_mom
-        # avoids cross-cancellation from the old combined RSS approach.
-        c_sum_lin_uw = (alpha_lin * sum_lin).sum(axis=1)  # unweighted
-        c_sum_non_uw = (alpha_non * sum_non).sum(axis=1)
-        rmse_phys = {}
-        for _tag, _w in _wtag_all:
-            if _tag not in bsq_p:
-                rmse_phys[_tag] = cp.zeros(n_sys, dtype=cp.float64)
-                continue
-            _lXTy = (alpha_lin[:,None,:] @ XTy_lin_p[_tag][:,:,None])[:,0,0]
-            _nXTy = (alpha_non[:,None,:] @ XTy_non_p[_tag][:,:,None])[:,0,0]
-            _lXl  = (alpha_lin[:,None,:] @ XTX_lin_p[_tag] @ alpha_lin[:,:,None])[:,0,0]
-            _nXn  = (alpha_non[:,None,:] @ XTX_non_p[_tag] @ alpha_non[:,:,None])[:,0,0]
-            _nXl  = (alpha_non[:,None,:] @ XTX_nl_p[_tag]  @ alpha_lin[:,:,None])[:,0,0]
-            _const = (cp.float64(n_total) * alpha_0**2
-                      - np.float64(2.0) * alpha_0 * sum_b
-                      + np.float64(2.0) * alpha_0 * (c_sum_lin_uw + c_sum_non_uw)
-                      ) if _tag == 'dat' else cp.float64(0.0)
-            _rss = cp.maximum(
-                bsq_p[_tag] + _const + _lXl + _nXn
-                - np.float64(2.0) * _lXTy - np.float64(2.0) * _nXTy
-                + np.float64(2.0) * _nXl,
-                cp.float64(0.0))
-            rmse_phys[_tag] = cp.sqrt(_rss / max(n_total, 1))
+        # RMSE identity (no second pass), expanded for block solve.
+        lin_XTy = (alpha_lin[:, None, :] @ XTy_lin[:, :, None])[:, 0, 0]
+        non_XTy = (alpha_non[:, None, :] @ XTy_non[:, :, None])[:, 0, 0]
+        lin_XTX_lin = (alpha_lin[:, None, :] @ XTX_lin @ alpha_lin[:, :, None])[:, 0, 0]
+        non_XTX_non = (alpha_non[:, None, :] @ XTX_non @ alpha_non[:, :, None])[:, 0, 0]
+        non_XTX_lin = (alpha_non[:, None, :] @ XTX_non_lin @ alpha_lin[:, :, None])[:, 0, 0]
+        c_sum_lin = (alpha_lin * sum_lin).sum(axis=1)
+        c_sum_non = (alpha_non * sum_non).sum(axis=1)
+        residual_ss = cp.maximum(
+            bsq
+            + cp.float64(n_total) * alpha_0**2
+            + lin_XTX_lin + non_XTX_non
+            - np.float64(2.0) * alpha_0 * sum_b
+            - np.float64(2.0) * lin_XTy
+            - np.float64(2.0) * non_XTy
+            + np.float64(2.0) * alpha_0 * (c_sum_lin + c_sum_non)
+            + np.float64(2.0) * non_XTX_lin,
+            cp.float64(0.0))
+        rmse_all = cp.sqrt(residual_ss / max(n_total, 1))
 
-        rmse_score = (w_dat * rmse_phys['dat'] + w_div * rmse_phys['div']
-                      + w_mom * rmse_phys['mom'])
-
-        alphas_cpu     = alphas_gpu.get()
-        rmse_score_cpu = rmse_score.get()
+        alphas_cpu = alphas_gpu.get()
+        rmse_cpu   = rmse_all.get()
         current_rmse_cpu = cp.sqrt(curr_sq / max(n_total, 1)).get()  # [n_models, n_comp]
 
         candidates = []
@@ -516,23 +460,24 @@ class GMDHTrainerGPU:
                 'k':     int(kr_arr[sys_idx]),
                 'i':     int(ic_arr[sys_idx]),
                 'alpha': alphas_cpu[sys_idx],
-                'err':   float(rmse_score_cpu[sys_idx]),
+                'err':   float(rmse_cpu[sys_idx]),
             })
         return candidates, current_rmse_cpu
 
 
     # ------------------------------------------------------------------
     def _compute_jacobian_rows_vectorized(self, phi_sub, dt_sub, grad_sub,
-            lap_sub, pg_ens, y_sub, s_gpu, kr_gpu, ic_gpu, ic_clamped, n_dim):
+            lap_sub, pg_sub, y_sub, s_gpu, kr_gpu, ic_gpu, ic_clamped, n_dim):
+        w_dat = np.float64(self.weights['data'])
+        w_div = np.float64(self.weights['div'])
+        w_mom = np.float64(self.weights['mom'])
         nu    = np.float64(self.viscosity)
         sp   = phi_sub[s_gpu, ic_gpu];  sdt  = dt_sub[s_gpu, ic_gpu]
         slap = lap_sub[s_gpu, ic_gpu];  kp   = phi_sub[kr_gpu, ic_gpu]
         kdt  = dt_sub[kr_gpu, ic_gpu];  klap = lap_sub[kr_gpu, ic_gpu]
         sg_all = grad_sub[s_gpu, ic_gpu]; kg_all = grad_sub[kr_gpu, ic_gpu]
         ub_all = phi_sub[s_gpu][:, :n_dim, :]
-        # Use ensemble pressure gradient (same for all s; depends only on ic).
-        # pg_ens: [n_dim, n_pts]; ic_clamped is in [0, n_dim-1].
-        pg_i = pg_ens[ic_clamped]   # [n_sys_chunk, n_pts]
+        pg_i = pg_sub[s_gpu, ic_clamped]
         if self.n_comp > n_dim:
             pg_i = cp.where((ic_gpu >= cp.int32(n_dim))[:, None], cp.float64(0.0), pg_i)
         y_t    = y_sub[ic_gpu]
@@ -540,6 +485,8 @@ class GMDHTrainerGPU:
         conv_k = (ub_all * kg_all).sum(axis=1)
         ar     = cp.arange(s_gpu.shape[0], dtype=cp.int32)
         gs_i   = sg_all[ar, ic_clamped]; gk_i = kg_all[ar, ic_clamped]
+        res_w  = ((sp-y_t)*w_dat + gs_i*w_div + (sdt+conv_s-nu*slap+pg_i)*w_mom)
+        b_train = -res_w
         sk = sp*kp; sk_dt = sdt*kp + sp*kdt
         sk_conv = (ub_all*(sg_all*kp[:,None,:] + sp[:,None,:]*kg_all)).sum(axis=1)
         dot_sk = (sg_all*kg_all).sum(axis=1)
@@ -548,42 +495,18 @@ class GMDHTrainerGPU:
         sk_lap = slap*kp + sp*klap + np.float64(2.0)*dot_sk
         s2_lap = np.float64(2.0)*dot_ss + np.float64(2.0)*sp*slap
         k2_lap = np.float64(2.0)*dot_kk + np.float64(2.0)*kp*klap
-
-        # Unweighted per-physics Jacobians and right-hand sides.
-        # Each term is kept separate so the caller can form
-        #   XTX = Σ_t w_t Jₜᵀ Jₜ   and   XTy = Σ_t w_t Jₜᵀ bₜ
-        # instead of collapsing them first (which would minimize (a+b+c)²
-        # rather than the correct a²+b²+c²).
-
-        # Data: Jₜ = d(f_new)/d(alpha),  bₜ = y_t − s  (target minus parent)
-        J_dat = cp.stack([
-            cp.ones_like(sp),
-            sp, kp, sk, sp*sp, kp*kp,
-        ], axis=2)
-        b_dat = y_t - sp
-
-        # Divergence: Jₜ = d(div f_new)/d(alpha),  bₜ = −div(s)
-        J_div = cp.stack([
+        # col 0 = zeros: constant basis function has zero physics derivative
+        J = cp.stack([
             cp.zeros_like(sp),
-            gs_i, gk_i,
-            gs_i*kp + sp*gk_i,
-            np.float64(2.0)*sp*gs_i,
-            np.float64(2.0)*kp*gk_i,
+            w_dat*sp + w_div*gs_i + w_mom*(sdt+conv_s-nu*slap),
+            w_dat*kp + w_div*gk_i + w_mom*(kdt+conv_k-nu*klap),
+            w_dat*sk + w_div*(gs_i*kp+sp*gk_i) + w_mom*(sk_dt+sk_conv-nu*sk_lap),
+            w_dat*sp*sp + w_div*(np.float64(2.0)*sp*gs_i) +
+                w_mom*(np.float64(2.0)*sp*sdt + np.float64(2.0)*sp*conv_s - nu*s2_lap),
+            w_dat*kp*kp + w_div*(np.float64(2.0)*kp*gk_i) +
+                w_mom*(np.float64(2.0)*kp*kdt + np.float64(2.0)*kp*conv_k - nu*k2_lap),
         ], axis=2)
-        b_div = -gs_i
-
-        # Momentum: Jₜ = d(momentum residual of f_new)/d(alpha),  bₜ = −mom(s)
-        J_mom = cp.stack([
-            cp.zeros_like(sp),
-            sdt + conv_s - nu*slap,
-            kdt + conv_k - nu*klap,
-            sk_dt + sk_conv - nu*sk_lap,
-            np.float64(2.0)*sp*sdt + np.float64(2.0)*sp*conv_s - nu*s2_lap,
-            np.float64(2.0)*kp*kdt + np.float64(2.0)*kp*conv_k - nu*k2_lap,
-        ], axis=2)
-        b_mom = -(sdt + conv_s - nu*slap + pg_i)
-
-        return J_dat, J_div, J_mom, b_dat, b_div, b_mom
+        return J, b_train
 
     # ------------------------------------------------------------------
     def _pack_polys(self, polys):

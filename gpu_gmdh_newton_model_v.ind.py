@@ -205,12 +205,11 @@ class GMDHTrainerGPU:
         self.current_models = self._initialize_layer_zero()
         best_rmse = float('inf'); best_layer = -1
         prev_avg_rmse = float('inf')
-        _model_weights = None  # ensemble pressure weights; uniform for layer 0
 
         for layer in range(n_layers):
             t_start = time.time()
             all_pg_polys = self._compute_pressure_grad_polys()
-            candidates, current_rmse = self._train_and_eval_layer(X_tr, y_tr, all_pg_polys, _model_weights)
+            candidates, current_rmse = self._train_and_eval_layer(X_tr, y_tr, all_pg_polys)
             t_layer = time.time() - t_start
 
             # Each candidate changes only one component (ic). Score by:
@@ -248,9 +247,6 @@ class GMDHTrainerGPU:
             best_rmse = layer_rmse; best_layer = layer
             prev_avg_rmse = avg_rmse
             self.current_models = self._assemble(winners)
-            # Update ensemble pressure weights for the next layer.
-            _w = np.array([1.0 / (w['combined_err'] + 1e-12) for w in winners])
-            _model_weights = _w / _w.sum()
             cp.get_default_memory_pool().free_all_blocks()
 
         print(f"Training complete. Best RMSE: {best_rmse:.6e} at layer {best_layer}.")
@@ -313,7 +309,7 @@ class GMDHTrainerGPU:
         return (cp.abs(corr) < cp.float64(threshold)).get()
 
     # ------------------------------------------------------------------
-    def _train_and_eval_layer(self, X, y, all_pg_polys, model_weights=None):
+    def _train_and_eval_layer(self, X, y, all_pg_polys):
         n_total  = X.shape[0]; n_models = len(self.current_models)
         n_dim    = self.n_vars - 1; n_ks = n_models - 1
         n_sys    = n_models * n_ks * self.n_comp
@@ -350,13 +346,6 @@ class GMDHTrainerGPU:
         kr_gpu     = cp.asarray(kr_arr, dtype=cp.int32)
         ic_clamped = cp.minimum(ic_gpu, cp.int32(n_dim - 1))
 
-        # Ensemble pressure gradient weights: inverse-error over models, normalized.
-        if model_weights is not None and len(model_weights) == n_models:
-            _pw = cp.asarray(model_weights, dtype=cp.float64)
-            _pg_weights = _pw / _pw.sum()
-        else:
-            _pg_weights = cp.full(n_models, 1.0 / n_models, dtype=cp.float64)
-
         curr_sq = cp.zeros((n_models, self.n_comp), dtype=cp.float64)
 
         w_dat = np.float64(self.weights['data'])
@@ -389,8 +378,6 @@ class GMDHTrainerGPU:
                 for d in range(n_dim):
                     if pg_model[d].exponents.shape[0] > 0:
                         pg_all[m_idx, d] = pg_model[d].evaluate(X_c)
-            # Ensemble pressure gradient: weighted sum over models → [n_dim, curr_n]
-            pg_ens = (_pg_weights[:, None, None] * pg_all).sum(axis=0)
             y_true = cp.stack(y_c, axis=0)
             diff = phi_all - y_true[None, :, :]   # [n_models, n_comp, curr_n]
             curr_sq += (diff * diff).sum(axis=2)   # [n_models, n_comp]
@@ -403,7 +390,7 @@ class GMDHTrainerGPU:
                         self._compute_jacobian_rows_vectorized(
                             phi_all[:, :, sl], dt_all[:, :, sl],
                             grad_all[:, :, :, sl], lap_all[:, :, sl],
-                            pg_ens[:, sl], y_true[:, sl],
+                            pg_all[:, :, sl], y_true[:, sl],
                             s_gpu[ss:se], kr_gpu[ss:se],
                             ic_gpu[ss:se], ic_clamped[ss:se], n_dim)
                     sum_b[ss:se]   += b_dat.sum(axis=1)
@@ -426,7 +413,7 @@ class GMDHTrainerGPU:
                         XTy_non_p[_tag][ss:se] += (J_non_T @ b_t[:, :, None])[:, :, 0]
                         XTX_nl_p[_tag][ss:se]  += J_non_T @ J_lin_t
                     del J_dat, J_div, J_mom, b_dat, b_div, b_mom
-            del phi_all, dt_all, grad_all, lap_all, pg_all, pg_ens, y_true
+            del phi_all, dt_all, grad_all, lap_all, pg_all, y_true
             cp.get_default_memory_pool().free_all_blocks()
 
         # Build combined weighted normal equations for the solve
@@ -523,16 +510,14 @@ class GMDHTrainerGPU:
 
     # ------------------------------------------------------------------
     def _compute_jacobian_rows_vectorized(self, phi_sub, dt_sub, grad_sub,
-            lap_sub, pg_ens, y_sub, s_gpu, kr_gpu, ic_gpu, ic_clamped, n_dim):
+            lap_sub, pg_sub, y_sub, s_gpu, kr_gpu, ic_gpu, ic_clamped, n_dim):
         nu    = np.float64(self.viscosity)
         sp   = phi_sub[s_gpu, ic_gpu];  sdt  = dt_sub[s_gpu, ic_gpu]
         slap = lap_sub[s_gpu, ic_gpu];  kp   = phi_sub[kr_gpu, ic_gpu]
         kdt  = dt_sub[kr_gpu, ic_gpu];  klap = lap_sub[kr_gpu, ic_gpu]
         sg_all = grad_sub[s_gpu, ic_gpu]; kg_all = grad_sub[kr_gpu, ic_gpu]
         ub_all = phi_sub[s_gpu][:, :n_dim, :]
-        # Use ensemble pressure gradient (same for all s; depends only on ic).
-        # pg_ens: [n_dim, n_pts]; ic_clamped is in [0, n_dim-1].
-        pg_i = pg_ens[ic_clamped]   # [n_sys_chunk, n_pts]
+        pg_i = pg_sub[s_gpu, ic_clamped]
         if self.n_comp > n_dim:
             pg_i = cp.where((ic_gpu >= cp.int32(n_dim))[:, None], cp.float64(0.0), pg_i)
         y_t    = y_sub[ic_gpu]

@@ -1,0 +1,14 @@
+.git/
+.idea/
+.vscode/
+.gitignore/
+.cursor/
+
+# Кеш Python та системні файли
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*_v.*.py
+poly_saves/
