@@ -1,0 +1,154 @@
+{
+  "mode": "chebyshev_adaptive_full_degree_growth",
+  "metrics_csv": "poly_saves/adaptive_uvp_cheb_degree_growth_to15.csv",
+  "stages": [
+    {
+      "stage": 0,
+      "degree": 5,
+      "start_sweep": 0,
+      "n_sweeps": 130,
+      "best_score": 0.003038441138417056,
+      "last_score": 0.0031001587132741554,
+      "best_stage_sweep": 114,
+      "stop_reason": "plateau",
+      "elapsed_seconds": 389.01548327109776
+    },
+    {
+      "stage": 1,
+      "degree": 6,
+      "start_sweep": 130,
+      "n_sweeps": 250,
+      "best_score": 0.0004241519279574378,
+      "last_score": 0.0004241519279574378,
+      "best_stage_sweep": 249,
+      "stop_reason": "max_sweeps",
+      "elapsed_seconds": 1649.9367971469183
+    },
+    {
+      "stage": 2,
+      "degree": 7,
+      "start_sweep": 380,
+      "n_sweeps": 250,
+      "best_score": 0.00020962269136934079,
+      "last_score": 0.00020962269136934079,
+      "best_stage_sweep": 249,
+      "stop_reason": "max_sweeps",
+      "elapsed_seconds": 3386.9569921121
+    },
+    {
+      "stage": 3,
+      "degree": 8,
+      "start_sweep": 630,
+      "n_sweeps": 250,
+      "best_score": 0.00015061038981388733,
+      "last_score": 0.00015061038981388733,
+      "best_stage_sweep": 249,
+      "stop_reason": "max_sweeps",
+      "elapsed_seconds": 6035.424846170936
+    },
+    {
+      "stage": 4,
+      "degree": 9,
+      "start_sweep": 880,
+      "n_sweeps": 140,
+      "best_score": 0.00014241287016657602,
+      "last_score": 0.00014241287016657602,
+      "best_stage_sweep": 139,
+      "stop_reason": "plateau",
+      "elapsed_seconds": 8021.629529443104
+    },
+    {
+      "stage": 5,
+      "degree": 10,
+      "start_sweep": 1020,
+      "n_sweeps": 121,
+      "best_score": 0.00013300144830193886,
+      "last_score": 0.00013300144830193886,
+      "best_stage_sweep": 120,
+      "stop_reason": "plateau",
+      "elapsed_seconds": 10524.726647624047
+    },
+    {
+      "stage": 6,
+      "degree": 11,
+      "start_sweep": 1141,
+      "n_sweeps": 40,
+      "best_score": 0.0001318897741222727,
+      "last_score": 0.0001318897741222727,
+      "best_stage_sweep": 39,
+      "stop_reason": "plateau",
+      "elapsed_seconds": 11721.187281795079
+    },
+    {
+      "stage": 7,
+      "degree": 12,
+      "start_sweep": 1181,
+      "n_sweeps": 40,
+      "best_score": 0.00013104110989766042,
+      "last_score": 0.00013104110989766042,
+      "best_stage_sweep": 39,
+      "stop_reason": "plateau",
+      "elapsed_seconds": 13674.101403295994
+    },
+    {
+      "stage": 8,
+      "degree": 13,
+      "start_sweep": 1221,
+      "n_sweeps": 40,
+      "best_score": 0.0001303421333458107,
+      "last_score": 0.0001303421333458107,
+      "best_stage_sweep": 39,
+      "stop_reason": "plateau",
+      "elapsed_seconds": 16005.31912688003
+    },
+    {
+      "stage": 9,
+      "degree": 14,
+      "start_sweep": 1261,
+      "n_sweeps": 40,
+      "best_score": 0.0001276425991979383,
+      "last_score": 0.0001276425991979383,
+      "best_stage_sweep": 39,
+      "stop_reason": "plateau",
+      "elapsed_seconds": 20193.16169070895
+    },
+    {
+      "stage": 10,
+      "degree": 15,
+      "start_sweep": 1301,
+      "n_sweeps": 40,
+      "best_score": 0.00012722263236686945,
+      "last_score": 0.00012722263236686945,
+      "best_stage_sweep": 39,
+      "stop_reason": "plateau",
+      "elapsed_seconds": 24584.26844557305
+    }
+  ],
+  "best": {
+    "score": 0.00012722263236686945,
+    "global_sweep": 1340,
+    "stage": 10,
+    "stage_sweep": 39,
+    "degree": 15,
+    "diag": {
+      "u": 6.832580612127244e-07,
+      "v": 6.563097546166263e-07,
+      "p": 0.0014159795622191269,
+      "px": 0.0006468542206269838,
+      "py": 0.0006119764248834173
+    }
+  },
+  "best_solution_prefix": "poly_saves/adaptive_uvp_cheb_degree_growth_to15_best",
+  "final_solution_prefix": "poly_saves/adaptive_uvp_cheb_degree_growth_to15_final",
+  "settings": {
+    "start_degree": 5,
+    "max_degree": 15,
+    "degree_increment": 1,
+    "min_sweeps_per_degree": 30,
+    "max_sweeps_per_degree": 250,
+    "plateau_window": 20,
+    "min_rel_improvement": 0.005,
+    "score_explosion_factor": 10.0
+  },
+  "elapsed_seconds": 24584.31435082294
+}

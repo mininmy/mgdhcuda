@@ -1,0 +1,95 @@
+{
+  "mode": "adaptive_moving_degree_window",
+  "metrics_csv": "poly_saves/adaptive_uvp_moving_window.csv",
+  "windows": [
+    {
+      "window": 0,
+      "degree_min": 0,
+      "degree_max": 5,
+      "start_sweep": 0,
+      "n_sweeps": 130,
+      "best_score": 0.0030384411384176274,
+      "last_score": 0.0031001587132746043,
+      "cumulative_terms": 56
+    },
+    {
+      "window": 1,
+      "degree_min": 1,
+      "degree_max": 6,
+      "start_sweep": 130,
+      "n_sweeps": 250,
+      "best_score": 0.0004030979669665751,
+      "last_score": 0.0004030979669665751,
+      "cumulative_terms": 84
+    },
+    {
+      "window": 2,
+      "degree_min": 2,
+      "degree_max": 7,
+      "start_sweep": 380,
+      "n_sweeps": 250,
+      "best_score": 0.00020457056605832988,
+      "last_score": 0.00020457056605832988,
+      "cumulative_terms": 120
+    },
+    {
+      "window": 3,
+      "degree_min": 3,
+      "degree_max": 8,
+      "start_sweep": 630,
+      "n_sweeps": 161,
+      "best_score": 0.0001826157483336803,
+      "last_score": 0.0001826157483336803,
+      "cumulative_terms": 165
+    },
+    {
+      "window": 4,
+      "degree_min": 4,
+      "degree_max": 9,
+      "start_sweep": 791,
+      "n_sweeps": 57,
+      "best_score": 0.00017885884286045434,
+      "last_score": 0.00017885884286045434,
+      "cumulative_terms": 220
+    },
+    {
+      "window": 5,
+      "degree_min": 5,
+      "degree_max": 10,
+      "start_sweep": 848,
+      "n_sweeps": 40,
+      "best_score": 0.00017681440930820066,
+      "last_score": 0.00017681440930820066,
+      "cumulative_terms": 286
+    }
+  ],
+  "best": {
+    "score": 0.00017681440930820066,
+    "global_sweep": 887,
+    "window": 5,
+    "window_sweep": 39,
+    "degree_window": [
+      5,
+      10
+    ],
+    "diag": {
+      "u": 2.9687789463062552e-05,
+      "v": 2.7767508270347482e-05,
+      "p": 0.006228473727965244,
+      "px": 0.0006096003637236442,
+      "py": 0.000583990752024262
+    }
+  },
+  "best_solution_prefix": "poly_saves/adaptive_uvp_moving_window_best",
+  "final_solution_prefix": "poly_saves/adaptive_uvp_moving_window_final",
+  "settings": {
+    "start_min_degree": 0,
+    "start_max_degree": 5,
+    "max_window_max_degree": 10,
+    "window_shift": 1,
+    "min_sweeps_per_window": 30,
+    "max_sweeps_per_window": 250,
+    "plateau_window": 20,
+    "min_rel_improvement": 0.005
+  }
+}

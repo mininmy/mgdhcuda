@@ -1,0 +1,106 @@
+{
+  "mode": "chebyshev_scheduled_growth",
+  "degree_schedule": [
+    [
+      8,
+      700
+    ],
+    [
+      10,
+      700
+    ],
+    [
+      12,
+      700
+    ],
+    [
+      14,
+      700
+    ],
+    [
+      15,
+      700
+    ]
+  ],
+  "metrics_csv": "poly_saves/adaptive_uvp_cheb_scheduled_growth_8_10_12_14_15.csv",
+  "stages": [
+    {
+      "stage": 0,
+      "degree": 8,
+      "start_sweep": 0,
+      "n_sweeps": 700,
+      "best_score": 0.01034303290301641,
+      "last_score": 0.01034303290301641,
+      "best_stage_sweep": 699,
+      "stop_reason": "max_sweeps",
+      "elapsed_seconds": 7427.00713501405
+    },
+    {
+      "stage": 1,
+      "degree": 10,
+      "start_sweep": 700,
+      "n_sweeps": 94,
+      "best_score": 0.009340115380545917,
+      "last_score": 0.009340115380545917,
+      "best_stage_sweep": 93,
+      "stop_reason": "plateau",
+      "elapsed_seconds": 9387.864907135954
+    },
+    {
+      "stage": 2,
+      "degree": 12,
+      "start_sweep": 794,
+      "n_sweeps": 40,
+      "best_score": 0.009216623820634182,
+      "last_score": 0.009216623820634182,
+      "best_stage_sweep": 39,
+      "stop_reason": "plateau",
+      "elapsed_seconds": 11336.562241924927
+    },
+    {
+      "stage": 3,
+      "degree": 14,
+      "start_sweep": 834,
+      "n_sweeps": 40,
+      "best_score": 0.009101948993359947,
+      "last_score": 0.009101948993359947,
+      "best_stage_sweep": 39,
+      "stop_reason": "plateau",
+      "elapsed_seconds": 15528.415820820956
+    },
+    {
+      "stage": 4,
+      "degree": 15,
+      "start_sweep": 874,
+      "n_sweeps": 40,
+      "best_score": 0.009072016394839575,
+      "last_score": 0.009072016394839575,
+      "best_stage_sweep": 39,
+      "stop_reason": "plateau",
+      "elapsed_seconds": 19922.185734611005
+    }
+  ],
+  "best": {
+    "score": 0.009072016394839575,
+    "global_sweep": 913,
+    "stage": 4,
+    "stage_sweep": 39,
+    "degree": 15,
+    "diag": {
+      "u": 3.8353621096370085e-05,
+      "v": 3.9231615996443576e-05,
+      "p": 0.02120643138840533,
+      "px": 0.04809692812944766,
+      "py": 0.04184738344801994
+    }
+  },
+  "best_solution_prefix": "poly_saves/adaptive_uvp_cheb_scheduled_growth_8_10_12_14_15_best",
+  "final_solution_prefix": "poly_saves/adaptive_uvp_cheb_scheduled_growth_8_10_12_14_15_final",
+  "settings": {
+    "min_sweeps_per_degree": 30,
+    "plateau_window": 20,
+    "min_rel_improvement": 0.005,
+    "score_explosion_factor": 10.0
+  },
+  "elapsed_seconds": 19922.231762560084
+}

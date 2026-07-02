@@ -1,0 +1,78 @@
+{
+  "metrics_csv": "poly_saves/uvp_stage_compare_5_to_8_vs_8_to_9.csv",
+  "runs": [
+    {
+      "name": "5_to_8",
+      "degree_stages": [
+        [
+          5,
+          115
+        ],
+        [
+          8,
+          250
+        ]
+      ],
+      "n_rows": 365,
+      "best": {
+        "run": "5_to_8",
+        "score": 0.0003833753026097228,
+        "global_sweep": 364,
+        "stage": 1,
+        "stage_sweep": 249,
+        "degree": 8,
+        "n_terms": 165,
+        "diag": {
+          "u": 3.2452977680953455e-05,
+          "v": 2.2501924028571917e-05,
+          "p": 0.006346538869291776,
+          "px": 0.0023970018890138328,
+          "py": 0.0008872021199881413
+        }
+      },
+      "best_solution_prefix": "poly_saves/uvp_stage_compare_5_to_8_best",
+      "final_solution_prefix": "poly_saves/uvp_stage_compare_5_to_8_final"
+    },
+    {
+      "name": "8_to_9",
+      "degree_stages": [
+        [
+          8,
+          115
+        ],
+        [
+          9,
+          250
+        ]
+      ],
+      "n_rows": 365,
+      "best": {
+        "run": "8_to_9",
+        "score": 0.014597798784558497,
+        "global_sweep": 364,
+        "stage": 1,
+        "stage_sweep": 249,
+        "degree": 9,
+        "n_terms": 220,
+        "diag": {
+          "u": 0.000880458571057443,
+          "v": 0.0008082849469248084,
+          "p": 0.04223960922497953,
+          "px": 0.0682870846746524,
+          "py": 0.06080346799111004
+        }
+      },
+      "best_solution_prefix": "poly_saves/uvp_stage_compare_8_to_9_best",
+      "final_solution_prefix": "poly_saves/uvp_stage_compare_8_to_9_final"
+    }
+  ],
+  "weights": {
+    "data": 1.0,
+    "div": 1.0,
+    "mom_x": 1.0,
+    "mom_y": 1.0,
+    "score_pressure_grad": 0.1
+  },
+  "total_points": 1000000,
+  "nu": 0.01
+}
